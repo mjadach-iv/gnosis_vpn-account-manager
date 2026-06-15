@@ -1,5 +1,7 @@
 # Gnosis VPN Account Manager
 
+![Screenshot of the interactive account menu](screenshot.png)
+
 A standalone Node.js CLI for managing multiple Gnosis VPN **accounts** (HOPR identities) on a single
 machine and swapping the active one on demand. Encrypted account files are stored in MySQL so they
 can be restored later.
@@ -78,7 +80,8 @@ the `.env` in the working directory (or `--env <path>`) is used as normal.
 ## Usage
 
 ```sh
-# Interactive: print the current account, save it if new, then offer to swap
+# Interactive menu: shows the current account, offers to save it, and lets you
+# swap/rename/delete saved accounts, clear the machine, or restart the service
 node src/index.js
 
 # Print the active on-disk account
@@ -98,6 +101,42 @@ Global options:
 
 - `--env <path>` — path to the `.env` file (default: `.env` in the cwd).
 - `--service <name>` — override the service unit/label to control.
+
+### Interactive menu
+
+Running with no subcommand opens an interactive menu (see the screenshot above).
+It prints the current on-disk account, then lists every saved account with its
+network and live on-chain balances (xDAI for the EOA, wxHOPR for the safe).
+
+When the current account isn't in the database yet, you're prompted **`Save this
+account to the database?`**:
+
+- Accept (default) to store it.
+- Decline to **skip saving** — the account stays active on disk but is not
+  written to the DB. The choice is remembered for the rest of the session, so
+  you aren't asked again on every screen redraw.
+
+Accounts already in the DB are kept in sync automatically (e.g. a safe address
+that was created after the account was first saved).
+
+Menu controls:
+
+- **↑ / ↓** — move between entries.
+- **Enter** — swap to the highlighted saved account (or insert it if no account
+  is currently on disk). You're asked to confirm first.
+- **r** — rename the highlighted saved account.
+- **Del / Backspace** — delete the highlighted saved account from the database
+  (you must type `Yes` to confirm).
+- **🗑 Clear current account from this machine** — back up and remove the
+  on-disk account files, letting the client regenerate a fresh identity.
+- **🔄 Restart the Gnosis VPN service** — restart the client without swapping.
+- **♻️ Refresh accounts** — re-read the DB and disk.
+- **🚪 Exit**.
+
+Swaps and clears back up the previous on-disk files first (to a `backup-<timestamp>/`
+directory next to the config) and write exactly the target account's files — if
+the target has no safe, any stale `.safe` from the previous account is removed so
+the result matches a freshly installed client.
 
 ## A note on privileges (sudo)
 
