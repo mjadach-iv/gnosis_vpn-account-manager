@@ -164,13 +164,32 @@ async function backupCurrent(files, timestamp) {
   return backupDir;
 }
 
+// Write a decrypted blob to disk, or remove any existing file when the account
+// doesn't carry that blob. This keeps a swap from leaving a stale file behind:
+// e.g. an account saved before its safe existed has no safe_blob, so swapping to
+// it must delete the previous account's .safe — otherwise the new EOA is paired
+// with the old safe instead of mimicking a freshly installed client.
+async function writeOrRemove(file, buf) {
+  if (buf != null) {
+    await fs.writeFile(file, buf, { mode: 0o600 });
+  } else {
+    try {
+      await fs.unlink(file);
+    } catch {
+      // Already absent — nothing to remove.
+    }
+  }
+}
+
 // Write the three decrypted blobs to their on-disk locations with tight perms.
+// The id always exists; pass/safe are written when present and otherwise cleared
+// so the on-disk state exactly matches the target account.
 async function writeAccountFiles(files, decrypted) {
   const dir = path.dirname(files.id);
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   await fs.writeFile(files.id, decrypted.id, { mode: 0o600 });
-  if (decrypted.pass != null) await fs.writeFile(files.pass, decrypted.pass, { mode: 0o600 });
-  if (decrypted.safe != null) await fs.writeFile(files.safe, decrypted.safe, { mode: 0o600 });
+  await writeOrRemove(files.pass, decrypted.pass);
+  await writeOrRemove(files.safe, decrypted.safe);
 }
 
 // Remove the current account from the machine: stop -> backup -> delete files
@@ -183,8 +202,6 @@ export async function clearFiles({ files, svc, timestamp }) {
         'service must be restarted. Re-run with sudo.',
     );
   }
-
-  if (svc.manager) await stopService(svc);
 
   const backupDir = await backupCurrent(files, timestamp);
   for (const file of Object.values(files)) {
@@ -200,8 +217,15 @@ export async function clearFiles({ files, svc, timestamp }) {
   return { backupDir, manager: svc.manager };
 }
 
-// Perform a full swap: stop -> backup -> write new files -> start.
+// Perform a full swap: backup -> write new files -> restart.
 // `decrypted` = { id, pass, safe } Buffers. Returns { backupDir, manager }.
+//
+// We deliberately do NOT pre-stop the service. `restartService` uses
+// `launchctl kickstart -k` (and `systemctl restart`), which kills the running
+// instance and restarts it — picking up the files we just wrote. An explicit
+// `launchctl stop` *before* the kickstart leaves the launchd job in a state it
+// doesn't reliably come back from, which is why the standalone restart (kickstart
+// only) works but a stop-then-restart left the service down.
 export async function swapFiles({ files, decrypted, svc, timestamp }) {
   if (!isRoot()) {
     throw new Error(
@@ -209,8 +233,6 @@ export async function swapFiles({ files, decrypted, svc, timestamp }) {
         'service must be restarted. Re-run with sudo.',
     );
   }
-
-  if (svc.manager) await stopService(svc);
 
   const backupDir = await backupCurrent(files, timestamp);
   await writeAccountFiles(files, decrypted);

@@ -69,7 +69,19 @@ async function saveAccount(pool, config, acc, { name, network } = {}) {
   }
 
   const existing = await db.findByAddress(pool, acc.address);
-  if (existing) return { id: existing.id, created: false };
+  if (existing) {
+    // The account may have been saved before its safe was created. If the
+    // on-disk account now carries a safe the stored row lacks (or differs),
+    // sync it so the DB matches the current account info — otherwise it keeps
+    // displaying a stale/empty safe and a wrong wxHOPR balance.
+    if (acc.safe && acc.safe !== existing.safe) {
+      const updates = { safe: acc.safe };
+      if (acc.files.safe) updates.safe_blob = encrypt(acc.files.safe, config.encryptionKey);
+      await db.updateAccount(pool, existing.id, updates);
+      return { id: existing.id, created: false, updated: true };
+    }
+    return { id: existing.id, created: false };
+  }
 
   const defaultName = `Account #${(await db.countAccounts(pool)) + 1}`;
   const accName = name || (await input({ message: 'Name for this account:', default: defaultName }));
@@ -168,6 +180,7 @@ async function withPool(opts, fn) {
 
 const CLEAR_ACTION = '__clear__';
 const RESTART_ACTION = '__restart__';
+const REFRESH_ACTION = '__refresh__';
 
 // Restart the Gnosis VPN service / app.
 async function restartApp({ serviceName } = {}) {
@@ -213,6 +226,10 @@ async function pause() {
 }
 
 async function interactive(config, pool, { serviceName } = {}) {
+  // EOA addresses the user chose not to save this session — so we don't
+  // re-prompt for the same account on every screen redraw.
+  const skipped = new Set();
+
   // Each iteration redraws the original screen (current account + menu).
   for (;;) {
     console.clear();
@@ -223,8 +240,30 @@ async function interactive(config, pool, { serviceName } = {}) {
     } else {
       printAccount('Current account:', acc);
       if (acc.address) {
-        const { id, created } = await saveAccount(pool, config, acc, {});
-        console.log(created ? `Saved as account #${id}.` : `Already saved as account #${id}.`);
+        const existing = await db.findByAddress(pool, acc.address);
+        if (!existing && skipped.has(acc.address)) {
+          console.log('Not saved — skipped this session.');
+        } else if (!existing) {
+          const wantSave = await confirm({
+            message: 'Save this account to the database?',
+            default: true,
+          });
+          if (wantSave) {
+            const { id, created } = await saveAccount(pool, config, acc, {});
+            console.log(created ? `Saved as account #${id}.` : `Already saved as account #${id}.`);
+          } else {
+            skipped.add(acc.address);
+            console.log('Not saved — skipped this session.');
+          }
+        } else {
+          // Already stored: let saveAccount sync the safe address if it changed.
+          const { id, updated } = await saveAccount(pool, config, acc, {});
+          console.log(
+            updated
+              ? `Updated account #${id} (safe address synced).`
+              : `Already saved as account #${id}.`,
+          );
+        }
       } else {
         console.log('Skipping save — EOA unknown (start the service or use `save --eoa`).');
       }
@@ -251,15 +290,20 @@ async function interactive(config, pool, { serviceName } = {}) {
           `#${r.id}  ${r.name}  ${r.address}  [${r.network || '?'}]  ` +
           `xDAI ${fmtBal(balances[i].xdai)} | wxHOPR ${fmtBal(balances[i].wxhopr)}`,
         value: r.id,
+        accountName: r.name,
         deletable: true,
       })),
     );
     choices.push({ name: '🔄  Restart the Gnosis VPN service', value: RESTART_ACTION, deletable: false });
+    choices.push({ name: '♻️  Refresh accounts (refetch from DB and disk)', value: REFRESH_ACTION, deletable: false });
     choices.push({ name: '🚪  Exit', value: null, deletable: false });
 
     const res = await accountMenu({ message: 'Choose an action:', choices });
 
     if (res.value == null) return; // exit
+
+    // Refresh: skip the pause and loop, re-reading disk + DB on the next pass.
+    if (res.value === REFRESH_ACTION) continue;
 
     if (res.value === RESTART_ACTION) {
       await restartApp({ serviceName });
@@ -273,6 +317,19 @@ async function interactive(config, pool, { serviceName } = {}) {
         console.log(`✔ Deleted account #${res.value} from the database.`);
       } else {
         console.log('Deletion cancelled.');
+      }
+    } else if (res.action === 'rename') {
+      // `r` on a saved account: prompt for a new name and update the DB.
+      const newName = await input({
+        message: `New name for account #${res.value}:`,
+        default: res.accountName,
+      });
+      const trimmed = newName.trim();
+      if (trimmed && trimmed !== res.accountName) {
+        await db.updateAccount(pool, res.value, { name: trimmed });
+        console.log(`✔ Renamed account #${res.value} to "${trimmed}".`);
+      } else {
+        console.log('Rename cancelled.');
       }
     } else if (res.value === CLEAR_ACTION) {
       await clearMachine(config, { serviceName });
@@ -342,11 +399,17 @@ program
         return;
       }
       printAccount('Current account:', acc);
-      const { id, created } = await saveAccount(pool, config, acc, {
+      const { id, created, updated } = await saveAccount(pool, config, acc, {
         name: cmdOpts.name,
         network: cmdOpts.network,
       });
-      console.log(created ? `\n✔ Saved as account #${id}.` : `\nAlready saved as account #${id}.`);
+      console.log(
+        created
+          ? `\n✔ Saved as account #${id}.`
+          : updated
+            ? `\n✔ Updated account #${id} (safe address synced).`
+            : `\nAlready saved as account #${id}.`,
+      );
     });
   });
 

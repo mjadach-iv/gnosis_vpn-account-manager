@@ -120,6 +120,24 @@ export async function deleteAccount(pool, id) {
   return res.affectedRows > 0;
 }
 
+// Update mutable fields of an existing account row. Only keys present in
+// `fields` (and on the allowlist) are written. Returns true if a row changed.
+export async function updateAccount(pool, id, fields) {
+  const allowed = ['name', 'safe', 'network', 'blokli_url', 'safe_blob'];
+  const sets = [];
+  const vals = [];
+  for (const key of allowed) {
+    if (fields[key] !== undefined) {
+      sets.push(`${key} = ?`);
+      vals.push(fields[key]);
+    }
+  }
+  if (!sets.length) return false;
+  vals.push(id);
+  const [res] = await pool.query(`UPDATE accounts SET ${sets.join(', ')} WHERE id = ?`, vals);
+  return res.affectedRows > 0;
+}
+
 // Insert a new account. Returns the inserted row id.
 export async function insertAccount(pool, account) {
   const { name, address, safe, network, blokli_url, id_blob, pass_blob, safe_blob } = account;
