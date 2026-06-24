@@ -11,10 +11,14 @@ const execFileAsync = promisify(execFile);
 const DEFAULT_SYSTEMD_UNIT = 'gnosisvpn';
 const DEFAULT_LAUNCHD_LABEL = 'com.gnosisvpn.gnosisvpnclient';
 
-// The GUI client app: macOS bundle id and the process / executable name used to
-// quit + relaunch it. Override via env if the install differs.
+// The GUI client app. macOS uses a bundle id; Linux uses the executable name
+// (`gnosis_vpn-app`, per the `Gnosis VPN.desktop` entry) and the desktop-file id
+// used to relaunch via `gtk-launch`. Override via env if the install differs.
 const APP_BUNDLE = process.env.GNOSISVPN_APP_BUNDLE || 'com.gnosisvpn.gnosisvpnclient';
-const APP_NAME = process.env.GNOSISVPN_APP_NAME || 'GnosisVPN';
+const APP_NAME =
+  process.env.GNOSISVPN_APP_NAME ||
+  (process.platform === 'darwin' ? 'GnosisVPN' : 'gnosis_vpn-app');
+const APP_DESKTOP_ID = process.env.GNOSISVPN_DESKTOP_ID || 'Gnosis VPN';
 
 // True when running as root (or on a platform without getuid, e.g. Windows).
 function isRoot() {
@@ -37,8 +41,13 @@ export async function detectService({ serviceName, platform = process.platform }
     if (serviceName) return { manager: 'systemd', name: serviceName };
     const res = await tryExec('systemctl', ['list-units', '--all', '--type=service', '*gnosis*']);
     if (res.ok) {
-      const m = res.stdout.match(/([\w@.-]+\.service)/);
-      return { manager: 'systemd', name: m ? m[1] : DEFAULT_SYSTEMD_UNIT };
+      // Skip phantom "not-found" rows (a referenced-but-uninstalled unit still
+      // appears under `--all`) and pick the first real unit.
+      const line = res.stdout
+        .split('\n')
+        .find((l) => /\.service/.test(l) && !/not-found/.test(l));
+      const m = line && line.match(/([\w@.-]+\.service)/);
+      if (m) return { manager: 'systemd', name: m[1] };
     }
     // systemctl present but nothing matched / not found.
     return { manager: null, name: serviceName || DEFAULT_SYSTEMD_UNIT };
@@ -101,12 +110,67 @@ function spawnDetached(cmd, args) {
 // must be launched into the original user's session, not root's.
 async function loginUser() {
   if (process.env.SUDO_USER && process.env.SUDO_USER !== 'root') return process.env.SUDO_USER;
-  const res = await tryExec('stat', ['-f', '%Su', '/dev/console']); // macOS console owner
-  const user = res.ok ? res.stdout.trim() : '';
-  return user && user !== 'root' ? user : null;
+  if (process.platform === 'darwin') {
+    const res = await tryExec('stat', ['-f', '%Su', '/dev/console']); // macOS console owner
+    const user = res.ok ? res.stdout.trim() : '';
+    return user && user !== 'root' ? user : null;
+  }
+  // Linux: the user owning an active graphical session (SESSION UID USER SEAT …).
+  const res = await tryExec('loginctl', ['list-sessions', '--no-legend']);
+  if (res.ok) {
+    for (const line of res.stdout.split('\n')) {
+      const user = line.trim().split(/\s+/)[2];
+      if (user && user !== 'root') return user;
+    }
+  }
+  return null;
 }
 
-// Quit and relaunch the GUI client app (best effort), in the login user's session.
+// GUI session env vars needed to launch a windowed app into a user's session.
+function guiSessionEnv(uid) {
+  const runtimeDir = `/run/user/${uid}`;
+  return [
+    `DISPLAY=${process.env.DISPLAY || ':0'}`,
+    `XDG_RUNTIME_DIR=${runtimeDir}`,
+    `DBUS_SESSION_BUS_ADDRESS=unix:path=${runtimeDir}/bus`,
+  ];
+}
+
+// Relaunch the GUI client on Linux into the desktop user's graphical session.
+// Prefers `gtk-launch <desktop-id>` (resolves the executable via the .desktop
+// entry the way the desktop does); falls back to `gio launch` then the binary.
+// Returns true if a launch was issued. When self-elevated via sudo we're root,
+// so we drop to the login user AND hand the app the session env, or no window
+// would appear. spawnDetached swallows spawn errors, so we probe with `which`.
+async function launchGuiLinux(user) {
+  const amRoot = typeof process.getuid !== 'function' || process.getuid() === 0;
+
+  let prefix = [];
+  if (amRoot && user) {
+    const idRes = await tryExec('id', ['-u', user]);
+    const uid = idRes.ok ? idRes.stdout.trim() : null;
+    if (uid) prefix = ['sudo', '-u', user, 'env', ...guiSessionEnv(uid)];
+  }
+
+  const attempts = [
+    ['gtk-launch', APP_DESKTOP_ID],
+    ['gio', 'launch', `/usr/share/applications/${APP_DESKTOP_ID}.desktop`],
+    [APP_NAME],
+  ];
+  for (const cmd of attempts) {
+    // The launcher binary must exist; under sudo, gtk-launch/gio are system bins
+    // and resolve the app within the user session even if APP_NAME isn't on
+    // root's PATH.
+    if (!(await tryExec('which', [cmd[0]])).ok) continue;
+    const argv = [...prefix, ...cmd];
+    spawnDetached(argv[0], argv.slice(1));
+    return true;
+  }
+  return false;
+}
+
+// Quit and relaunch the GUI client app (best effort), in the login user's
+// session. Returns true if a relaunch was issued.
 async function restartGuiApp(platform = process.platform) {
   const user = await loginUser();
 
@@ -119,33 +183,35 @@ async function restartGuiApp(platform = process.platform) {
       if (uid) {
         // `launchctl asuser` targets the user's GUI session for the relaunch.
         await tryExec('launchctl', ['asuser', uid, 'sudo', '-u', user, 'open', '-b', APP_BUNDLE]);
-        return;
+        return true;
       }
     }
     await tryExec('open', ['-b', APP_BUNDLE]);
-    return;
+    return true;
   }
 
   if (platform === 'linux') {
     await tryExec('pkill', ['-f', APP_NAME]);
-    // Relaunch detached in the user's session if we know who they are.
-    if (user) {
-      spawnDetached('sudo', ['-u', user, APP_NAME]);
-    } else {
-      spawnDetached(APP_NAME, []);
-    }
+    return launchGuiLinux(user);
   }
+
+  return false;
 }
 
-// Restart the background service AND the GUI client app.
+// Restart the background service (if one is managed) AND the GUI client app.
+// Returns { serviceRestarted, guiLaunched } so callers can report what happened.
 export async function restartService(svc) {
+  let serviceRestarted = false;
   if (svc.manager === 'systemd') {
     const res = await tryExec('systemctl', ['restart', svc.name]);
     if (!res.ok) throw new Error(`systemctl restart ${svc.name} failed: ${res.error.message}`);
+    serviceRestarted = true;
   } else if (svc.manager === 'launchd') {
     await restartLaunchd(svc.name);
+    serviceRestarted = true;
   }
-  await restartGuiApp();
+  const guiLaunched = await restartGuiApp();
+  return { serviceRestarted, guiLaunched };
 }
 
 // Back up the current on-disk account files into backup-<ts>/ next to .config.
@@ -194,7 +260,7 @@ async function writeAccountFiles(files, decrypted) {
 
 // Remove the current account from the machine: stop -> backup -> delete files
 // -> restart. Restarting lets the client regenerate a fresh identity. Returns
-// { backupDir, manager }.
+// { backupDir, manager, guiLaunched }.
 export async function clearFiles({ files, svc, timestamp }) {
   if (!isRoot()) {
     throw new Error(
@@ -212,13 +278,15 @@ export async function clearFiles({ files, svc, timestamp }) {
     }
   }
 
-  if (svc.manager) await restartService(svc);
+  // Always restart: restartService no-ops the service when none is managed but
+  // still relaunches the GUI client so it picks up the new on-disk files.
+  const { guiLaunched } = await restartService(svc);
 
-  return { backupDir, manager: svc.manager };
+  return { backupDir, manager: svc.manager, guiLaunched };
 }
 
 // Perform a full swap: backup -> write new files -> restart.
-// `decrypted` = { id, pass, safe } Buffers. Returns { backupDir, manager }.
+// `decrypted` = { id, pass, safe } Buffers. Returns { backupDir, manager, guiLaunched }.
 //
 // We deliberately do NOT pre-stop the service. `restartService` uses
 // `launchctl kickstart -k` (and `systemctl restart`), which kills the running
@@ -237,7 +305,9 @@ export async function swapFiles({ files, decrypted, svc, timestamp }) {
   const backupDir = await backupCurrent(files, timestamp);
   await writeAccountFiles(files, decrypted);
 
-  if (svc.manager) await restartService(svc);
+  // Always restart: restartService no-ops the service when none is managed but
+  // still relaunches the GUI client so it picks up the new on-disk files.
+  const { guiLaunched } = await restartService(svc);
 
-  return { backupDir, manager: svc.manager };
+  return { backupDir, manager: svc.manager, guiLaunched };
 }

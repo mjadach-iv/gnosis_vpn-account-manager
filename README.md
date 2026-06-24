@@ -129,7 +129,7 @@ Menu controls:
   (you must type `Yes` to confirm).
 - **🗑 Clear current account from this machine** — back up and remove the
   on-disk account files, letting the client regenerate a fresh identity.
-- **🔄 Restart the Gnosis VPN service** — restart the client without swapping.
+- **🔄 Restart the Gnosis VPN** — restart the client without swapping.
 - **♻️ Refresh accounts** — re-read the DB and disk.
 - **🚪 Exit**.
 

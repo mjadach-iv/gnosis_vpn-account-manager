@@ -116,17 +116,11 @@ async function doSwap(pool, config, target, { serviceName } = {}) {
   };
 
   const svc = await detectService({ serviceName });
-  if (!svc.manager) {
-    console.log(
-      '\n⚠  No service manager detected — writing account files only. ' +
-        'Restart the Gnosis VPN client manually for the change to take effect.',
-    );
-  }
 
   // No account on disk => we're inserting one, not swapping from an existing one.
   const inserting = !current;
 
-  const { backupDir, manager } = await swapFiles({
+  const { backupDir, manager, guiLaunched } = await swapFiles({
     files: config.files,
     decrypted,
     svc,
@@ -136,6 +130,13 @@ async function doSwap(pool, config, target, { serviceName } = {}) {
   console.log(`\n✔ ${inserting ? 'Inserted' : 'Swapped to'} account ${target.id} (${target.name}).`);
   if (!inserting) console.log(`  Previous files backed up to: ${backupDir}`);
   if (manager) console.log(`  Service (${manager}) restarted: ${svc.name}`);
+  if (guiLaunched) console.log('  GUI client app relaunched.');
+  if (!manager && !guiLaunched) {
+    console.log(
+      '\n⚠  Neither a service nor the GUI app could be restarted automatically. ' +
+        'Restart the Gnosis VPN client manually for the change to take effect.',
+    );
+  }
 
   // Warn if stored network differs from the service's detected network.
   const { network: detected } = await detectNetwork({ serviceName });
@@ -185,12 +186,15 @@ const REFRESH_ACTION = '__refresh__';
 // Restart the Gnosis VPN service / app.
 async function restartApp({ serviceName } = {}) {
   const svc = await detectService({ serviceName });
-  if (!svc.manager) {
-    console.log('\n⚠  No service manager detected — cannot restart automatically.');
+  const { serviceRestarted, guiLaunched } = await restartService(svc);
+  if (!serviceRestarted && !guiLaunched) {
+    console.log('\n⚠  Could not restart Gnosis VPN — no service unit or GUI app found.');
     return;
   }
-  await restartService(svc);
-  console.log(`\n✔ Restarted the Gnosis VPN service (${svc.manager}): ${svc.name}.`);
+  const parts = [];
+  if (serviceRestarted) parts.push(`service (${svc.manager}: ${svc.name})`);
+  if (guiLaunched) parts.push('GUI app');
+  console.log(`\n✔ Restarted Gnosis VPN: ${parts.join(' + ')}.`);
 }
 
 // Remove the current on-disk account from this machine (with confirmation).
@@ -208,7 +212,7 @@ async function clearMachine(config, { serviceName } = {}) {
   if (!ok) return;
 
   const svc = await detectService({ serviceName });
-  const { backupDir, manager } = await clearFiles({
+  const { backupDir, manager, guiLaunched } = await clearFiles({
     files: config.files,
     svc,
     timestamp: nowStamp(),
@@ -217,6 +221,9 @@ async function clearMachine(config, { serviceName } = {}) {
   console.log(`  Files backed up to: ${backupDir}`);
   if (manager) {
     console.log(`  Service (${manager}) restarted: ${svc.name} — the client will regenerate a fresh identity.`);
+  }
+  if (guiLaunched) {
+    console.log('  GUI client app relaunched — it will regenerate a fresh identity.');
   }
 }
 
@@ -294,7 +301,7 @@ async function interactive(config, pool, { serviceName } = {}) {
         deletable: true,
       })),
     );
-    choices.push({ name: '🔄  Restart the Gnosis VPN service', value: RESTART_ACTION, deletable: false });
+    choices.push({ name: '🔄  Restart the Gnosis VPN', value: RESTART_ACTION, deletable: false });
     choices.push({ name: '♻️  Refresh accounts (refetch from DB and disk)', value: REFRESH_ACTION, deletable: false });
     choices.push({ name: '🚪  Exit', value: null, deletable: false });
 
