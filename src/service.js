@@ -1,12 +1,18 @@
 // Detect the service manager (systemd / launchd), stop/start the Gnosis VPN
-// client, and perform the file swap (with a backup of the current files).
+// client, perform the file swap (with a backup of the current files), and reset
+// the machine to a freshly-installed state.
 
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { LAUNCHD_PLIST, guiSettingsFile } from './paths.js';
+import { resetClientState } from './reset.js';
+import { applyNetwork } from './network.js';
 
 const execFileAsync = promisify(execFile);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const DEFAULT_SYSTEMD_UNIT = 'gnosisvpn';
 const DEFAULT_LAUNCHD_LABEL = 'com.gnosisvpn.gnosisvpnclient';
@@ -169,14 +175,23 @@ async function launchGuiLinux(user) {
   return false;
 }
 
-// Quit and relaunch the GUI client app (best effort), in the login user's
-// session. Returns true if a relaunch was issued.
-async function restartGuiApp(platform = process.platform) {
-  const user = await loginUser();
-
+// Quit the GUI client app (best effort). It must be down before the daemon is
+// stopped, or it keeps re-triggering connections.
+async function quitGuiApp(platform = process.platform) {
   if (platform === 'darwin') {
     await tryExec('osascript', ['-e', `tell application id "${APP_BUNDLE}" to quit`]);
     await tryExec('pkill', ['-x', APP_NAME]);
+  } else if (platform === 'linux') {
+    await tryExec('pkill', ['-f', APP_NAME]);
+  }
+}
+
+// Launch the GUI client app into the login user's session (best effort).
+// Returns true if a launch was issued.
+async function launchGuiApp(platform = process.platform) {
+  const user = await loginUser();
+
+  if (platform === 'darwin') {
     if (user) {
       const idRes = await tryExec('id', ['-u', user]);
       const uid = idRes.ok ? idRes.stdout.trim() : '';
@@ -190,12 +205,16 @@ async function restartGuiApp(platform = process.platform) {
     return true;
   }
 
-  if (platform === 'linux') {
-    await tryExec('pkill', ['-f', APP_NAME]);
-    return launchGuiLinux(user);
-  }
+  if (platform === 'linux') return launchGuiLinux(user);
 
   return false;
+}
+
+// Quit and relaunch the GUI client app (best effort), in the login user's
+// session. Returns true if a relaunch was issued.
+async function restartGuiApp(platform = process.platform) {
+  await quitGuiApp(platform);
+  return launchGuiApp(platform);
 }
 
 // Restart the background service (if one is managed) AND the GUI client app.
@@ -212,6 +231,168 @@ export async function restartService(svc) {
   }
   const guiLaunched = await restartGuiApp();
   return { serviceRestarted, guiLaunched };
+}
+
+// --- Full stop / start -----------------------------------------------------
+//
+// `restartService` above is the cheap path: systemd restart, or launchd
+// `kickstart -k`. kickstart re-execs the job launchd has already loaded, so it
+// will NOT pick up a rewritten plist — anything that changes the plist (i.e.
+// switching networks) must go through stopClient/startClient, which bootout and
+// bootstrap the job so the new definition is read.
+
+// Stop the GUI app and the daemon, and wait for them to actually be gone.
+export async function stopClient(svc, platform = process.platform) {
+  await quitGuiApp(platform);
+
+  if (svc.manager === 'systemd') {
+    await tryExec('systemctl', ['stop', svc.name]);
+  } else if (svc.manager === 'launchd') {
+    // Prefer the plist-path form, fall back to the label.
+    const res = await tryExec('launchctl', ['bootout', 'system', LAUNCHD_PLIST]);
+    if (!res.ok) await tryExec('launchctl', ['bootout', `system/${svc.name}`]);
+    await sleep(2000);
+    await tryExec('pkill', ['-TERM', '-x', 'gnosis_vpn-root']);
+    await sleep(2000);
+    await tryExec('pkill', ['-KILL', '-x', 'gnosis_vpn-root']);
+  }
+}
+
+// Start the daemon and relaunch the GUI app.
+// Returns { started, guiLaunched }.
+export async function startClient(svc, platform = process.platform) {
+  let started = false;
+
+  if (svc.manager === 'systemd') {
+    // A crash-looping unit trips StartLimitBurst and `start` is refused until
+    // the failure counter is cleared — the installer does this too.
+    await tryExec('systemctl', ['reset-failed', svc.name]);
+    const res = await tryExec('systemctl', ['start', svc.name]);
+    if (!res.ok) throw new Error(`systemctl start ${svc.name} failed: ${res.error.message}`);
+    started = true;
+  } else if (svc.manager === 'launchd') {
+    let res = await tryExec('launchctl', ['bootstrap', 'system', LAUNCHD_PLIST]);
+    if (!res.ok) {
+      // Usually "service already loaded": boot it out and bootstrap again, so a
+      // rewritten plist is still read. Falling straight through to kickstart
+      // here would re-exec the job with its OLD definition.
+      await tryExec('launchctl', ['bootout', 'system', LAUNCHD_PLIST]);
+      await sleep(2000);
+      res = await tryExec('launchctl', ['bootstrap', 'system', LAUNCHD_PLIST]);
+    }
+    await tryExec('launchctl', ['enable', `system/${svc.name}`]);
+    started = res.ok;
+    if (!started) {
+      // Couldn't load the definition at all — at least get the client running.
+      await restartLaunchd(svc.name);
+      started = true;
+    }
+  }
+
+  const guiLaunched = await launchGuiApp(platform);
+  return { started, guiLaunched };
+}
+
+// --- Reset / network switch ------------------------------------------------
+
+// Resolve a user's home directory. We're root after self-elevation, so
+// process.env.HOME is root's, not the desktop user's.
+async function userHome(user, platform = process.platform) {
+  if (!user) return null;
+  if (platform === 'darwin') {
+    const res = await tryExec('dscl', ['.', '-read', `/Users/${user}`, 'NFSHomeDirectory']);
+    const m = res.ok && res.stdout.match(/NFSHomeDirectory:\s*(.+)/);
+    return m ? m[1].trim() : `/Users/${user}`;
+  }
+  const res = await tryExec('getent', ['passwd', user]);
+  const fields = res.ok ? res.stdout.trim().split(':') : [];
+  return fields[5] || `/home/${user}`;
+}
+
+// The desktop user's GUI settings file, or null if there's no desktop user.
+async function guiSettingsPath(platform = process.platform) {
+  const home = await userHome(await loginUser(), platform);
+  return guiSettingsFile(home, platform);
+}
+
+// applyNetwork writes several files; a failure partway leaves the config
+// half-switched. It is idempotent, so re-running is the fix.
+function switchError(err) {
+  return new Error(
+    `${err.message}\nThe client's network configuration may be half-written — ` +
+      're-run the switch once the cause is fixed.',
+  );
+}
+
+function requireRoot(what) {
+  if (!isRoot()) {
+    throw new Error(
+      `${what} requires root: the client's files live under system directories and the ` +
+        'service must be restarted. Re-run with sudo.',
+    );
+  }
+}
+
+// Reset the machine to the state a fresh client install leaves behind, and
+// optionally point it at a different network on the way back up.
+// Nothing is backed up on disk — the account's encrypted copy in the database is
+// the backup, so callers must confirm before calling this.
+// Returns { removed, skipped, applied, manager, started, guiLaunched }.
+export async function resetMachine({ config, svc, network, platform = process.platform }) {
+  requireRoot('Clearing');
+
+  await stopClient(svc, platform);
+
+  const { removed, skipped } = await resetClientState({
+    home: config.home,
+    files: config.files,
+    platform,
+    guiSettingsFile: await guiSettingsPath(platform),
+  });
+
+  let applied = null;
+  try {
+    if (network) applied = await applyNetwork(network, { platform });
+  } catch (err) {
+    // Don't leave the machine with the client down because the switch failed.
+    await startClient(svc, platform).catch(() => {});
+    throw switchError(err);
+  }
+
+  const { started, guiLaunched } = await startClient(svc, platform);
+  return { removed, skipped, applied, manager: svc.manager, started, guiLaunched };
+}
+
+// Switch the installed client to another network, keeping the account on disk.
+// The GUI's saved exit-node location is cleared: it may name a destination the
+// new network doesn't have.
+// Returns { applied, removed, manager, started, guiLaunched }.
+export async function switchMachineNetwork({ svc, network, platform = process.platform }) {
+  requireRoot('Switching networks');
+
+  await stopClient(svc, platform);
+
+  let applied;
+  try {
+    applied = await applyNetwork(network, { platform });
+  } catch (err) {
+    await startClient(svc, platform).catch(() => {});
+    throw switchError(err);
+  }
+
+  const removed = [];
+  const settings = await guiSettingsPath(platform);
+  if (settings) {
+    try {
+      await fs.rm(settings, { force: false });
+      removed.push(settings);
+    } catch {
+      // Absent or unreadable — the user can re-pick the location in the app.
+    }
+  }
+
+  const { started, guiLaunched } = await startClient(svc, platform);
+  return { applied, removed, manager: svc.manager, started, guiLaunched };
 }
 
 // Back up the current on-disk account files into backup-<ts>/ next to .config.
@@ -256,33 +437,6 @@ async function writeAccountFiles(files, decrypted) {
   await fs.writeFile(files.id, decrypted.id, { mode: 0o600 });
   await writeOrRemove(files.pass, decrypted.pass);
   await writeOrRemove(files.safe, decrypted.safe);
-}
-
-// Remove the current account from the machine: stop -> backup -> delete files
-// -> restart. Restarting lets the client regenerate a fresh identity. Returns
-// { backupDir, manager, guiLaunched }.
-export async function clearFiles({ files, svc, timestamp }) {
-  if (!isRoot()) {
-    throw new Error(
-      'Clearing requires root: the account files live under a system directory and the ' +
-        'service must be restarted. Re-run with sudo.',
-    );
-  }
-
-  const backupDir = await backupCurrent(files, timestamp);
-  for (const file of Object.values(files)) {
-    try {
-      await fs.unlink(file);
-    } catch {
-      // Already absent — nothing to remove.
-    }
-  }
-
-  // Always restart: restartService no-ops the service when none is managed but
-  // still relaunches the GUI client so it picks up the new on-disk files.
-  const { guiLaunched } = await restartService(svc);
-
-  return { backupDir, manager: svc.manager, guiLaunched };
 }
 
 // Perform a full swap: backup -> write new files -> restart.

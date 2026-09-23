@@ -7,8 +7,20 @@ import { loadConfig } from './config.js';
 import { encrypt, decrypt } from './crypto.js';
 import * as db from './db.js';
 import { readCurrentAccount } from './account.js';
-import { detectNetwork, networkFromUrl } from './network.js';
-import { detectService, swapFiles, clearFiles, restartService } from './service.js';
+import {
+  detectNetwork,
+  networkFromUrl,
+  installedNetworks,
+  KNOWN_NETWORKS,
+} from './network.js';
+import {
+  detectService,
+  swapFiles,
+  resetMachine,
+  switchMachineNetwork,
+  restartService,
+} from './service.js';
+import { SERVICE_CONFIG_DIR } from './paths.js';
 import { chainBalances } from './ctl.js';
 import { accountMenu } from './menu.js';
 import { ensureRoot } from './elevate.js';
@@ -43,6 +55,8 @@ function fmtBal(s) {
   return Number.isFinite(n) ? n.toLocaleString('en-US', { maximumFractionDigits: 4 }) : s;
 }
 
+const OTHER_NETWORK = '__other__';
+
 // Resolve a network value, prompting/mapping as needed.
 async function resolveNetwork(acc, optNetwork) {
   if (optNetwork) return optNetwork;
@@ -51,13 +65,66 @@ async function resolveNetwork(acc, optNetwork) {
     const mapped = networkFromUrl(acc.blokliUrl);
     if (mapped) return mapped;
   }
-  return select({
+  const picked = await select({
     message: 'Network could not be detected. Which network is this account for?',
     choices: [
-      { name: 'rotsee', value: 'rotsee' },
-      { name: 'jura', value: 'jura' },
+      ...KNOWN_NETWORKS.map((n) => ({ name: n, value: n })),
+      { name: 'other (type a name)…', value: OTHER_NETWORK },
     ],
   });
+  if (picked !== OTHER_NETWORK) return picked;
+  const typed = await input({ message: 'Network name:' });
+  return typed.trim().toLowerCase() || null;
+}
+
+// Prompt for a network to configure the client with. Offers the networks
+// actually installed on this machine (the only ones the client can load),
+// falling back to the known names when the config dir can't be read.
+async function pickNetwork({ current, message } = {}) {
+  const installed = await installedNetworks();
+  if (!installed.length) {
+    console.log(
+      `\n⚠  Could not read ${SERVICE_CONFIG_DIR} — offering the known networks rather than the ` +
+        'ones installed here. Picking one that is not installed will fail.',
+    );
+  }
+  const names = installed.length ? installed : KNOWN_NETWORKS;
+
+  const picked = await select({
+    message: message || 'Which network should the client use?',
+    choices: [
+      ...names.map((n) => ({ name: n === current ? `${n}  (current)` : n, value: n })),
+      { name: 'other (type a name)…', value: OTHER_NETWORK },
+    ],
+  });
+  if (picked !== OTHER_NETWORK) return picked;
+  const typed = await input({ message: 'Network name:' });
+  return typed.trim().toLowerCase() || null;
+}
+
+// Report what a reset / switch did.
+function printMachineResult({ removed, skipped, applied, manager, started, guiLaunched }, svc) {
+  if (removed?.length) {
+    console.log(`  Removed ${removed.length} item(s):`);
+    for (const p of removed) console.log(`    - ${p}`);
+  }
+  if (applied) {
+    console.log(`  Network     : ${applied.network}`);
+    console.log(`  Blokli URL  : ${applied.blokliUrl}`);
+    for (const p of applied.changed) console.log(`    wrote ${p}`);
+  }
+  if (started) console.log(`  Service (${manager}) started: ${svc.name}`);
+  if (guiLaunched) console.log('  GUI client app relaunched.');
+  if (!manager && !guiLaunched) {
+    console.log(
+      '\n⚠  Neither a service nor the GUI app could be started automatically. ' +
+        'Start the Gnosis VPN client manually.',
+    );
+  }
+  if (skipped?.length) {
+    console.log('\n⚠  Could not remove:');
+    for (const s of skipped) console.log(`    - ${s.path} (${s.reason})`);
+  }
 }
 
 // Save the given on-disk account to the DB. Returns { id, created }.
@@ -180,6 +247,8 @@ async function withPool(opts, fn) {
 // --- interactive default flow ---------------------------------------------
 
 const CLEAR_ACTION = '__clear__';
+const CLEAR_SWITCH_ACTION = '__clear_switch__';
+const SWITCH_ACTION = '__switch__';
 const RESTART_ACTION = '__restart__';
 const REFRESH_ACTION = '__refresh__';
 
@@ -197,34 +266,94 @@ async function restartApp({ serviceName } = {}) {
   console.log(`\n✔ Restarted Gnosis VPN: ${parts.join(' + ')}.`);
 }
 
-// Remove the current on-disk account from this machine (with confirmation).
-async function clearMachine(config, { serviceName } = {}) {
+// Reset this machine to a freshly-installed client state, optionally switching
+// the network on the way back up. `switchNetwork` is either a network name or
+// `true` to prompt for one.
+async function clearMachine(config, pool, { serviceName, switchNetwork } = {}) {
   const acc = await readCurrentAccount(config, { serviceName });
-  if (!acc) {
+  if (!acc && !switchNetwork) {
     console.log('No account on disk to clear.');
     return;
   }
+
+  let target = null;
+  if (switchNetwork) {
+    target =
+      typeof switchNetwork === 'string'
+        ? switchNetwork
+        : await pickNetwork({ current: acc?.network, message: 'Switch the client to which network?' });
+    if (!target) {
+      console.log('No network chosen — nothing done.');
+      return;
+    }
+  }
+
+  const who = acc ? acc.address || 'unknown EOA' : 'no account on disk';
   const ok = await confirm({
-    message: `Remove the current account (${acc.address || 'unknown EOA'}) from this machine? ` +
-      'Files are backed up first.',
+    message:
+      `Reset this machine to a freshly-installed client state (${who})` +
+      `${target ? ` and switch to "${target}"` : ''}? ` +
+      'The identity, node database, caches and logs are deleted, not backed up.',
+    default: false,
+  });
+  if (!ok) return;
+
+  // Nothing is kept on disk, so the encrypted copy in the database is the only
+  // way back. Make an unsaved account an explicit, typed decision.
+  if (acc?.address) {
+    const saved = await db.findByAddress(pool, acc.address);
+    if (!saved) {
+      const answer = await input({
+        message:
+          `⚠  ${acc.address} is NOT saved in the database and cannot be recovered afterwards. ` +
+          'Type "Yes" to delete it anyway:',
+      });
+      if (answer.trim().toLowerCase() !== 'yes') {
+        console.log('Cancelled — nothing was removed.');
+        return;
+      }
+    }
+  }
+
+  const svc = await detectService({ serviceName });
+  const result = await resetMachine({ config, svc, network: target });
+
+  console.log(
+    `\n✔ Reset this machine to a freshly-installed client state${target ? ` on "${target}"` : ''}.`,
+  );
+  printMachineResult(result, svc);
+  console.log('  The client will generate a fresh identity on start-up.');
+}
+
+// Point the installed client at another network, keeping the account on disk.
+async function switchNetworkOnMachine({ serviceName, network } = {}) {
+  const { network: current } = await detectNetwork({ serviceName });
+  const target =
+    network ||
+    (await pickNetwork({ current, message: 'Switch the client to which network?' }));
+  if (!target) {
+    console.log('No network chosen — nothing done.');
+    return;
+  }
+  if (target === current) {
+    console.log(`The client is already configured for "${target}". Nothing to do.`);
+    return;
+  }
+
+  const ok = await confirm({
+    message:
+      `Switch the client from "${current || 'unknown'}" to "${target}"? ` +
+      'The account on disk is kept — its safe and node database belong to the old network, ' +
+      'so clearing the account as well is usually the right move.',
     default: false,
   });
   if (!ok) return;
 
   const svc = await detectService({ serviceName });
-  const { backupDir, manager, guiLaunched } = await clearFiles({
-    files: config.files,
-    svc,
-    timestamp: nowStamp(),
-  });
-  console.log('\n✔ Cleared the account from this machine.');
-  console.log(`  Files backed up to: ${backupDir}`);
-  if (manager) {
-    console.log(`  Service (${manager}) restarted: ${svc.name} — the client will regenerate a fresh identity.`);
-  }
-  if (guiLaunched) {
-    console.log('  GUI client app relaunched — it will regenerate a fresh identity.');
-  }
+  const result = await switchMachineNetwork({ svc, network: target });
+
+  console.log(`\n✔ Switched the client to "${target}".`);
+  printMachineResult(result, svc);
 }
 
 // Wait for Enter, then redraw the screen for the next menu iteration.
@@ -290,7 +419,17 @@ async function interactive(config, pool, { serviceName } = {}) {
         value: CLEAR_ACTION,
         deletable: false,
       });
+      choices.push({
+        name: '🔀  Clear account and switch network',
+        value: CLEAR_SWITCH_ACTION,
+        deletable: false,
+      });
     }
+    choices.push({
+      name: '🌐  Switch network (keep the account)',
+      value: SWITCH_ACTION,
+      deletable: false,
+    });
     choices.push(
       ...rows.map((r, i) => ({
         name:
@@ -339,7 +478,11 @@ async function interactive(config, pool, { serviceName } = {}) {
         console.log('Rename cancelled.');
       }
     } else if (res.value === CLEAR_ACTION) {
-      await clearMachine(config, { serviceName });
+      await clearMachine(config, pool, { serviceName });
+    } else if (res.value === CLEAR_SWITCH_ACTION) {
+      await clearMachine(config, pool, { serviceName, switchNetwork: true });
+    } else if (res.value === SWITCH_ACTION) {
+      await switchNetworkOnMachine({ serviceName });
     } else {
       const target = await db.getAccountById(pool, res.value);
       const verb = acc ? 'Swap to' : 'Insert';
@@ -390,7 +533,7 @@ program
   .command('save')
   .description('save the current on-disk account to the DB')
   .option('--name <name>', 'account name')
-  .option('--network <network>', 'network (jura|rotsee)')
+  .option('--network <network>', `network (${KNOWN_NETWORKS.join('|')})`)
   .option('--eoa <address>', 'EOA address (used if the service is unreachable)')
   .action(async (cmdOpts) => {
     ensureRoot();
@@ -436,6 +579,31 @@ program
       }
       await doSwap(pool, config, target, { serviceName: opts.service });
     });
+  });
+
+program
+  .command('clear')
+  .description('reset this machine to a freshly-installed client state')
+  .option('--switch-network <network>', 'also point the client at this network')
+  .action(async (cmdOpts) => {
+    ensureRoot();
+    const opts = program.opts();
+    await withPool(opts, (config, pool) =>
+      clearMachine(config, pool, {
+        serviceName: opts.service,
+        switchNetwork: cmdOpts.switchNetwork,
+      }),
+    );
+  });
+
+program
+  .command('switch-network')
+  .description('point the installed client at another network (keeps the account)')
+  .argument('[network]', 'network name; prompts when omitted')
+  .action(async (network) => {
+    ensureRoot();
+    const opts = program.opts();
+    await switchNetworkOnMachine({ serviceName: opts.service, network });
   });
 
 // Default action (no subcommand) = interactive flow.

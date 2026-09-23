@@ -16,6 +16,46 @@ export const ENV = {
   blokliUrl: 'GNOSISVPN_HOPR_BLOKLI_URL',
 };
 
+// The client's system config directory (same path on linux and macOS). The
+// installer symlinks config.toml to the selected network's config:
+// config-<network>.toml on linux, <network>.toml on macOS.
+// The GNOSISVPN_ETC override exists for testing and non-standard installs.
+export const SERVICE_CONFIG_DIR = process.env.GNOSISVPN_ETC || '/etc/gnosisvpn';
+export const SERVICE_CONFIG_LINK = `${SERVICE_CONFIG_DIR}/config.toml`;
+
+// linux: the env file the installer generates to carry the Blokli endpoint.
+// (gnosisvpn.env next to it is a dpkg conffile whose value is kept empty — the
+// installer re-empties it on every run, so we must never write to it.)
+export const DYNAMIC_ENV_FILE = `${SERVICE_CONFIG_DIR}/gnosisvpn-dynamic.env`;
+
+// macOS: the launchd daemon, and where the installer records the chosen network
+// so a later pkg run or in-app update doesn't flip it back to the default.
+export const LAUNCHD_PLIST =
+  process.env.GNOSISVPN_LAUNCHD_PLIST ||
+  '/Library/LaunchDaemons/com.gnosisvpn.gnosisvpnclient.plist';
+export const MAC_NETWORK_CHOICE =
+  process.env.GNOSISVPN_NETWORK_CHOICE_FILE ||
+  '/Library/Logs/GnosisVPN/installer/network_choice';
+
+// The bundle/app id the GUI client uses for its per-user data directory.
+export const APP_ID = 'com.gnosisvpn.gnosisvpnclient';
+
+// Where the client writes its log (the installer creates the directory, the
+// service creates the file).
+export function logDir(platform = process.platform) {
+  if (process.env.GNOSISVPN_LOG_DIR) return process.env.GNOSISVPN_LOG_DIR;
+  return platform === 'darwin' ? '/Library/Logs/GnosisVPN' : '/var/log/gnosisvpn';
+}
+
+// The GUI app's per-user settings file, holding among other things the saved
+// exit-node location — which can name a destination another network doesn't have.
+export function guiSettingsFile(userHome, platform = process.platform) {
+  if (!userHome) return null;
+  return platform === 'darwin'
+    ? path.join(userHome, 'Library', 'Application Support', APP_ID, 'settings.json')
+    : path.join(userHome, '.local', 'share', APP_ID, 'settings.json');
+}
+
 // Default $GNOSISVPN_HOME per platform.
 export function defaultHome(platform = process.platform) {
   if (platform === 'darwin') return '/Library/Application Support/GnosisVPN';
