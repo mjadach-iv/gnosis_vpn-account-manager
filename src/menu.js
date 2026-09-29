@@ -17,7 +17,10 @@ import {
   isUpKey,
   isDownKey,
   isBackspaceKey,
+  usePagination,
 } from '@inquirer/core';
+
+const PAGE_SIZE = 10;
 
 export const accountMenu = createPrompt((config, done) => {
   const { message, choices } = config;
@@ -50,13 +53,19 @@ export const accountMenu = createPrompt((config, done) => {
     }
   });
 
+  const list = usePagination({
+    items: choices,
+    active,
+    pageSize: PAGE_SIZE,
+    loop: false,
+    renderItem: ({ item, isActive }) =>
+      isActive ? `\x1b[36m❯ ${item.name}\x1b[0m` : `  ${item.name}`,
+  });
+
   if (status === 'done') {
     return `${prefix} ${message}`;
   }
 
-  const list = choices
-    .map((c, i) => (i === active ? `\x1b[36m❯ ${c.name}\x1b[0m` : `  ${c.name}`))
-    .join('\n');
   const help =
     '\x1b[2m(↑/↓ move · Enter select · r rename · Del/Backspace remove a saved account)\x1b[0m';
 
