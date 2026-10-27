@@ -7,6 +7,7 @@ import { loadConfig } from './config.js';
 import { encrypt, decrypt } from './crypto.js';
 import * as db from './db.js';
 import { readCurrentAccount } from './account.js';
+import { deriveEoa } from './identity.js';
 import {
   detectNetwork,
   networkFromUrl,
@@ -356,6 +357,31 @@ async function switchNetworkOnMachine({ serviceName, network } = {}) {
   printMachineResult(result, svc);
 }
 
+// Decrypt a saved account's identity and print its chain private key.
+async function showPrivateKey(config, pool, id) {
+  const target = await db.getAccountById(pool, id);
+  if (!target.pass_blob) {
+    console.log(`Account #${id} has no stored identity password — cannot decrypt it.`);
+    return;
+  }
+
+  const ok = await confirm({
+    message: `Print the private key of "${target.name}" (${target.address}) to the terminal?`,
+    default: false,
+  });
+  if (!ok) return;
+
+  const { privateKey, address } = deriveEoa(
+    decrypt(target.id_blob, config.encryptionKey),
+    decrypt(target.pass_blob, config.encryptionKey),
+  );
+  console.log(`\n  Gnosis address: ${address}`);
+  console.log(`  Private key   : ${privateKey}`);
+  if (target.address && address.toLowerCase() !== target.address.toLowerCase()) {
+    console.log(`\n⚠  Derived address differs from the stored EOA (${target.address}).`);
+  }
+}
+
 // Wait for Enter, then redraw the screen for the next menu iteration.
 async function pause() {
   await input({ message: 'Press Enter to return to the menu…' });
@@ -477,6 +503,8 @@ async function interactive(config, pool, { serviceName } = {}) {
       } else {
         console.log('Rename cancelled.');
       }
+    } else if (res.action === 'privkey') {
+      await showPrivateKey(config, pool, res.value);
     } else if (res.value === CLEAR_ACTION) {
       await clearMachine(config, pool, { serviceName });
     } else if (res.value === CLEAR_SWITCH_ACTION) {
