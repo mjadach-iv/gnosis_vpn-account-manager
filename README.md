@@ -209,7 +209,7 @@ Menu controls:
   is currently on disk). You're asked to confirm first.
 - **r** — rename the highlighted saved account.
 - **p** — decrypt the highlighted saved account's identity and print its
-  address and private key (confirm with `y`).
+  address, safe address and private key (confirm with `y`).
 - **Del / Backspace** — delete the highlighted saved account from the database
   (you must type `Yes` to confirm).
 - **🗑 Clear current account from this machine** — reset the machine to a

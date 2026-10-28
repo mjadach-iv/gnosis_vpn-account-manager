@@ -376,6 +376,7 @@ async function showPrivateKey(config, pool, id) {
     decrypt(target.pass_blob, config.encryptionKey),
   );
   console.log(`\n  Gnosis address: ${address}`);
+  console.log(`  Safe address  : ${fmtAddr(target.safe)}`);
   console.log(`  Private key   : ${privateKey}`);
   if (target.address && address.toLowerCase() !== target.address.toLowerCase()) {
     console.log(`\n⚠  Derived address differs from the stored EOA (${target.address}).`);
