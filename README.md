@@ -9,20 +9,39 @@ can be restored later.
 This tool does not touch the Gnosis VPN client's binaries or packaging. It interacts with the
 *installed* client through these external interfaces only:
 
-1. **On-disk account files** under `$GNOSISVPN_HOME/.config/`:
-   - `gnosisvpn-hopr.id` — encrypted HOPR identity
-   - `gnosisvpn-hopr.pass` — identity password
-   - `gnosisvpn-hopr.safe` — YAML with `safe_address` + `module_address`
+1. **On-disk account files** — see [Where the account lives](#where-the-account-lives):
+   - `hopr.id` — encrypted HOPR identity
+   - `hopr.pass` — identity password
+   - `hopr.safe` — YAML with `safe_address` + `module_address`
 2. **The `gnosis_vpn-ctl` CLI** — `gnosis_vpn-ctl --output json balance` for the node EOA + safe.
 3. **The service manager** — systemd (Linux) / launchd (macOS) to stop/start the client.
-4. **Client-generated state**, when you reset a machine: the rest of `$GNOSISVPN_HOME`
-   (the node database, caches) plus the runtime socket/lock files and the client log.
+4. **Client-generated state**, when you reset a machine: the rest of the account's network slot
+   (e.g. ticket and PIX databases), the runtime socket/lock files and the client and worker logs.
 5. **The client's network configuration**, and only when you switch networks: the
    `/etc/gnosisvpn/config.toml` symlink, `/etc/gnosisvpn/gnosisvpn-dynamic.env` (Linux), and the
    launchd plist + `network_choice` (macOS). These are written exactly as the client's own
    installer writes them — see [Switching networks](#switching-networks).
 
-`$GNOSISVPN_HOME` defaults: Linux `/var/lib/gnosisvpn`, macOS `/Library/Application Support/GnosisVPN`.
+### Where the account lives
+
+Since installer **0.97.0** (client 0.98.0) the client runs its worker as the desktop user, and keeps
+one account per user **and per network**:
+
+| | Linux | macOS |
+|---|---|---|
+| `hopr.id`, `hopr.pass` | `~/.local/share/gnosisvpn/networks/<network>/` | `~/Library/Application Support/GnosisVPN/networks/<network>/` |
+| `hopr.safe` (a cache) | `~/.cache/gnosisvpn/networks/<network>/` | `~/Library/Caches/GnosisVPN/networks/<network>/` |
+| worker logs | `~/.local/state/gnosisvpn/` | `~/Library/Logs/GnosisVPN/` |
+
+The user is the one you ran `sudo` from, else the desktop session's user; `--user <name>` picks
+another. The network is the one the client is configured for (see [Networks](#networks)). Files
+are written owned by that user, `0600`, in `0700` directories — as the worker creates them.
+
+Older installers keep a single shared identity in `$GNOSISVPN_HOME/.config/gnosisvpn-hopr.{id,pass,safe}`
+(Linux `/var/lib/gnosisvpn`, macOS `/Library/Application Support/GnosisVPN`), which the tool still
+supports. It picks the layout from `/etc/gnosisvpn/version.txt`; set `GNOSISVPN_LAYOUT=per-user` or
+`legacy` to override (e.g. for a dev build of the client). The encrypted blobs in the database are the
+same for both, so accounts saved under one layout restore under the other.
 
 ## Install
 
@@ -116,6 +135,8 @@ Global options:
 
 - `--env <path>` — path to the `.env` file (default: `.env` in the cwd).
 - `--service <name>` — override the service unit/label to control.
+- `--user <name>` — whose account to manage under the per-user layout (default: the `sudo` user,
+  else the desktop session's user).
 
 ### Networks
 
@@ -133,8 +154,12 @@ The network is detected read-only, in this order:
    `/etc/default/gnosisvpn` or `systemctl cat <unit>` (Linux); the LaunchDaemons plist (macOS).
 
 If none of those identify the network, `save` asks — pick one of the known names or type your own.
-`--network <name>` skips the prompt. After a swap, a warning is printed if the account's stored
-network differs from the one the client is currently configured for; nothing is reconfigured.
+`--network <name>` skips the prompt. Under the per-user layout the network also decides where the
+account is read and written, so the tool stops with an error when it can't be detected.
+
+A swap always writes into the slot the client currently uses. If the account's stored network
+differs, a warning is printed and nothing is reconfigured — under the per-user layout the account
+then sits in the other network's slot, and a later network switch won't take it along.
 
 ### Clearing a machine
 
@@ -142,15 +167,18 @@ A clear returns the machine to the exact state a fresh install of the client lea
 client bootstraps a brand-new identity on the next start. It stops the GUI app and the daemon, then
 removes everything the *running* client created:
 
-- `$GNOSISVPN_HOME/.config/` — the identity, password, safe **and the node database**
-- `$GNOSISVPN_HOME/.cache/`, and a legacy `wg0_gnosisvpn.conf` if one is left over
+- per-user layout: the account's slot for the current network — `networks/<network>/` in both the
+  data and the cache dir (identity, password, safe and any ticket/PIX databases) — and the user's
+  worker logs. Other networks' slots are separate accounts and are kept.
+- legacy layout: `$GNOSISVPN_HOME/.config/` (identity, password, safe **and the node database**),
+  `$GNOSISVPN_HOME/.cache/`, and a leftover `wg0_gnosisvpn.conf`
 - the runtime socket, pid, lock and `teardown-state.json`
 - the client log and its rotations
 
-Everything the *installer* ships is kept — on macOS that includes `uninstall.sh` and
-`process-control.sh` in the state directory, and `/Library/Logs/GnosisVPN/installer/` (which holds
-the recorded network choice). The macOS updater's own state (`updates/`, `last_update_attempt.json`,
-`updates.log`) is left alone too, so it doesn't re-download on the next check.
+Everything the *installer* ships is kept: the installer's choice files (including the recorded
+network choice), and on legacy macOS installs `uninstall.sh` and `process-control.sh` in the state
+directory. So are the updater's state and logs, and legacy identity backups
+(`.config.migrated-*`, `.config.*.bak`).
 
 The GUI app's per-user `settings.json` is removed as well, because its saved exit-node location may
 not exist on another network.
@@ -168,7 +196,7 @@ installer does, then restarts the client:
 |---|---|---|
 | config | `config.toml` → `config-<network>.toml` (absolute) | `config.toml` → `<network>.toml` (relative) |
 | endpoint | `gnosisvpn-dynamic.env`, `root:root` 0644 | `GNOSISVPN_HOPR_BLOKLI_URL` in the launchd plist, `root:wheel` 0644, `plutil`-validated |
-| recorded choice | — | `/Library/Logs/GnosisVPN/installer/network_choice` |
+| recorded choice | — | `/Library/Application Support/GnosisVPN/installer/network_choice` (`/Library/Logs/GnosisVPN/installer/` before 0.97.0) |
 | restart | `systemctl reset-failed` + `start` | `launchctl bootout` + `bootstrap` |
 
 `/etc/gnosisvpn/gnosisvpn.env` is never written: it's a dpkg conffile whose Blokli value the
@@ -181,9 +209,12 @@ The networks you're offered are the ones actually installed on the machine (`con
 `*.toml` in `/etc/gnosisvpn`), since those are the only ones the client can load; picking an
 uninstalled one is refused with the list of available names.
 
-Switching keeps the account on disk, but its safe and node database belong to the old network — so
-**clear and switch** is usually what you want. Plain switch exists for when you know the account
-carries over.
+Under the per-user layout each network has its own account: switching leaves the current one in
+its slot and the client uses the target network's (generating one if the slot is empty) — the
+confirmation says which. **Clear and switch** additionally removes the current network's account.
+
+Under the legacy layout the single identity carries over, but its safe and node database belong to
+the old network — so **clear and switch** is usually what you want there.
 
 ### Interactive menu
 
@@ -222,18 +253,26 @@ Menu controls:
 - **♻️ Refresh accounts** — re-read the DB and disk.
 - **🚪 Exit**.
 
-Swaps back up the previous on-disk files first (to a `backup-<timestamp>/`
-directory next to the config) and write exactly the target account's files — if
-the target has no safe, any stale `.safe` from the previous account is removed so
-the result matches a freshly installed client. Clears do **not** back up (see below).
+Swaps back up the previous account first and write exactly the target account's
+files, so nothing of the previous account is left behind:
+
+- per-user layout: the network's slot is moved aside whole, to
+  `networks/<network>.backup-<timestamp>/` in the data and cache dirs, and the
+  target's files are written into a fresh slot.
+- legacy layout: the three files are copied to a `backup-<timestamp>/` directory
+  next to the config; if the target has no safe, any stale `.safe` is removed.
+
+Clears do **not** back up (see [Clearing a machine](#clearing-a-machine)).
 
 ## A note on privileges (sudo)
 
-Account files live under `/var/lib` (Linux) or `/Library` (macOS) and controlling the service needs
-root. Run swaps with `sudo` when not already root:
+Account files are owned by the desktop user (or, before installer 0.97.0, by the client's service
+user under `/var/lib` / `/Library`), and controlling the service needs root. The tool re-runs itself
+under `sudo` when not already root, so run it as yourself (or with `sudo`) — the sudo user is whose
+account it manages. From a plain root shell, pass `--user <name>`.
 
 ```sh
-sudo node src/index.js swap 3
+node src/index.js swap 3            # same as: sudo node src/index.js swap 3
 ```
 
 The tool will warn and exit with a clear message if it lacks the privileges it needs.

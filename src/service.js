@@ -4,11 +4,13 @@
 
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
+import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { LAUNCHD_PLIST, guiSettingsFile } from './paths.js';
 import { resetClientState } from './reset.js';
 import { applyNetwork } from './network.js';
+import { loginUser, userHome } from './user.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -110,26 +112,6 @@ function spawnDetached(cmd, args) {
   } catch {
     // Binary missing / not launchable — ignore.
   }
-}
-
-// The logged-in (GUI) user. When self-elevated via sudo we're root, so GUI apps
-// must be launched into the original user's session, not root's.
-async function loginUser() {
-  if (process.env.SUDO_USER && process.env.SUDO_USER !== 'root') return process.env.SUDO_USER;
-  if (process.platform === 'darwin') {
-    const res = await tryExec('stat', ['-f', '%Su', '/dev/console']); // macOS console owner
-    const user = res.ok ? res.stdout.trim() : '';
-    return user && user !== 'root' ? user : null;
-  }
-  // Linux: the user owning an active graphical session (SESSION UID USER SEAT …).
-  const res = await tryExec('loginctl', ['list-sessions', '--no-legend']);
-  if (res.ok) {
-    for (const line of res.stdout.split('\n')) {
-      const user = line.trim().split(/\s+/)[2];
-      if (user && user !== 'root') return user;
-    }
-  }
-  return null;
 }
 
 // GUI session env vars needed to launch a windowed app into a user's session.
@@ -295,24 +277,10 @@ export async function startClient(svc, platform = process.platform) {
 
 // --- Reset / network switch ------------------------------------------------
 
-// Resolve a user's home directory. We're root after self-elevation, so
-// process.env.HOME is root's, not the desktop user's.
-async function userHome(user, platform = process.platform) {
-  if (!user) return null;
-  if (platform === 'darwin') {
-    const res = await tryExec('dscl', ['.', '-read', `/Users/${user}`, 'NFSHomeDirectory']);
-    const m = res.ok && res.stdout.match(/NFSHomeDirectory:\s*(.+)/);
-    return m ? m[1].trim() : `/Users/${user}`;
-  }
-  const res = await tryExec('getent', ['passwd', user]);
-  const fields = res.ok ? res.stdout.trim().split(':') : [];
-  return fields[5] || `/home/${user}`;
-}
-
 // The desktop user's GUI settings file, or null if there's no desktop user.
-async function guiSettingsPath(platform = process.platform) {
-  const home = await userHome(await loginUser(), platform);
-  return guiSettingsFile(home, platform);
+async function guiSettingsPath(location, platform = process.platform) {
+  const home = location.user?.home ?? (await userHome(await loginUser(), platform));
+  return guiSettingsFile(home, platform, location.layout);
 }
 
 // applyNetwork writes several files; a failure partway leaves the config
@@ -337,22 +305,22 @@ function requireRoot(what) {
 // optionally point it at a different network on the way back up.
 // Nothing is backed up on disk — the account's encrypted copy in the database is
 // the backup, so callers must confirm before calling this.
+// `location` is the account slot to clear, from locateAccount().
 // Returns { removed, skipped, applied, manager, started, guiLaunched }.
-export async function resetMachine({ config, svc, network, platform = process.platform }) {
+export async function resetMachine({ location, svc, network, platform = process.platform }) {
   requireRoot('Clearing');
 
   await stopClient(svc, platform);
 
   const { removed, skipped } = await resetClientState({
-    home: config.home,
-    files: config.files,
+    location,
     platform,
-    guiSettingsFile: await guiSettingsPath(platform),
+    guiSettingsFile: await guiSettingsPath(location, platform),
   });
 
   let applied = null;
   try {
-    if (network) applied = await applyNetwork(network, { platform });
+    if (network) applied = await applyNetwork(network, { platform, layout: location.layout });
   } catch (err) {
     // Don't leave the machine with the client down because the switch failed.
     await startClient(svc, platform).catch(() => {});
@@ -367,21 +335,21 @@ export async function resetMachine({ config, svc, network, platform = process.pl
 // The GUI's saved exit-node location is cleared: it may name a destination the
 // new network doesn't have.
 // Returns { applied, removed, manager, started, guiLaunched }.
-export async function switchMachineNetwork({ svc, network, platform = process.platform }) {
+export async function switchMachineNetwork({ location, svc, network, platform = process.platform }) {
   requireRoot('Switching networks');
 
   await stopClient(svc, platform);
 
   let applied;
   try {
-    applied = await applyNetwork(network, { platform });
+    applied = await applyNetwork(network, { platform, layout: location.layout });
   } catch (err) {
     await startClient(svc, platform).catch(() => {});
     throw switchError(err);
   }
 
   const removed = [];
-  const settings = await guiSettingsPath(platform);
+  const settings = await guiSettingsPath(location, platform);
   if (settings) {
     try {
       await fs.rm(settings, { force: false });
@@ -439,8 +407,87 @@ async function writeAccountFiles(files, decrypted) {
   await writeOrRemove(files.safe, decrypted.safe);
 }
 
+// Per-user layout: move a network slot dir to <dir>.backup-<ts>, after the toolkit's
+// <network>.<reason>-<ts> for slots it moves aside (a '.' never forms a network
+// name). An empty slot is just removed. Returns the backup path, or null when
+// nothing was kept.
+async function moveSlotAside(dir, timestamp) {
+  let entries;
+  try {
+    entries = await fs.readdir(dir);
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  }
+  if (!entries.length) {
+    await fs.rmdir(dir);
+    return null;
+  }
+  const aside = `${dir}.backup-${timestamp}`;
+  await fs.rename(dir, aside);
+  return aside;
+}
+
+// Create the missing dirs below `from` down to `to`, owned by `owner`.
+async function mkdirOwned(from, to, mode, owner) {
+  let cur = from;
+  for (const part of path.relative(from, to).split(path.sep).filter(Boolean)) {
+    cur = path.join(cur, part);
+    try {
+      await fs.mkdir(cur, { mode });
+    } catch (err) {
+      if (err.code === 'EEXIST') continue;
+      throw err;
+    }
+    await fs.lchown(cur, owner.uid, owner.gid);
+  }
+}
+
+// The modes the worker gives its state tree: shared parents 0755, the state root
+// and below 0700.
+async function ensureSlotDir(user, root, dir) {
+  await mkdirOwned(user.home, path.dirname(root), 0o755, user);
+  await mkdirOwned(path.dirname(root), dir, 0o700, user);
+}
+
+const WRITE_NOFOLLOW =
+  fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW;
+
+// Root writing into a user-owned dir: never follow a planted symlink, and hand the
+// file to the user since their worker must read it.
+async function writeOwned(file, buf, owner) {
+  const fh = await fs.open(file, WRITE_NOFOLLOW, 0o600);
+  try {
+    await fh.writeFile(buf);
+    await fh.chown(owner.uid, owner.gid);
+  } finally {
+    await fh.close();
+  }
+}
+
+// Per-user layout: replace the whole network slot, so per-identity state beyond
+// the three files (e.g. the PIX db) can't leak into the target account. Returns
+// the backup of the data slot, which holds the previous identity.
+async function swapSlot({ files, user, dirs }, decrypted, timestamp) {
+  const dataDir = path.dirname(files.id);
+  const cacheDir = path.dirname(files.safe);
+  const backupDir = await moveSlotAside(dataDir, timestamp);
+  await moveSlotAside(cacheDir, timestamp);
+
+  await ensureSlotDir(user, dirs.data, dataDir);
+  await writeOwned(files.id, decrypted.id, user);
+  if (decrypted.pass) await writeOwned(files.pass, decrypted.pass, user);
+  // Only a cache — without it the worker re-queries the safe from chain.
+  if (decrypted.safe) {
+    await ensureSlotDir(user, dirs.cache, cacheDir);
+    await writeOwned(files.safe, decrypted.safe, user);
+  }
+  return backupDir;
+}
+
 // Perform a full swap: backup -> write new files -> restart.
-// `decrypted` = { id, pass, safe } Buffers. Returns { backupDir, manager, guiLaunched }.
+// `location` is the slot to write, from locateAccount(); `decrypted` = { id, pass,
+// safe } Buffers. Returns { backupDir, manager, guiLaunched }.
 //
 // We deliberately do NOT pre-stop the service. `restartService` uses
 // `launchctl kickstart -k` (and `systemctl restart`), which kills the running
@@ -448,16 +495,21 @@ async function writeAccountFiles(files, decrypted) {
 // `launchctl stop` *before* the kickstart leaves the launchd job in a state it
 // doesn't reliably come back from, which is why the standalone restart (kickstart
 // only) works but a stop-then-restart left the service down.
-export async function swapFiles({ files, decrypted, svc, timestamp }) {
+export async function swapFiles({ location, decrypted, svc, timestamp }) {
   if (!isRoot()) {
     throw new Error(
-      'Swapping requires root: the account files live under a system directory and the ' +
-        'service must be restarted. Re-run with sudo.',
+      'Swapping requires root: the account files are owned by the client or another user and ' +
+        'the service must be restarted. Re-run with sudo.',
     );
   }
 
-  const backupDir = await backupCurrent(files, timestamp);
-  await writeAccountFiles(files, decrypted);
+  let backupDir;
+  if (location.layout === 'per-user') {
+    backupDir = await swapSlot(location, decrypted, timestamp);
+  } else {
+    backupDir = await backupCurrent(location.files, timestamp);
+    await writeAccountFiles(location.files, decrypted);
+  }
 
   // Always restart: restartService no-ops the service when none is managed but
   // still relaunches the GUI client so it picks up the new on-disk files.

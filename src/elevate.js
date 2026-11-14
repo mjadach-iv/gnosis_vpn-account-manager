@@ -1,5 +1,6 @@
-// Self-elevate to root on POSIX so the tool can read/write the root-owned
-// Gnosis VPN account files under $GNOSISVPN_HOME/.config/.
+// Self-elevate to root on POSIX so the tool can read/write the Gnosis VPN account
+// files (owned by the client's service user or, from installer 0.97.0, the desktop
+// user) and control the service.
 //
 // If we're not already root, re-exec the *same* process under `sudo`, inheriting
 // the terminal so sudo can prompt for the password, then exit with sudo's status.

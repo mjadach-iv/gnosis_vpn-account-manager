@@ -6,7 +6,7 @@ import { input, select, confirm } from '@inquirer/prompts';
 import { loadConfig } from './config.js';
 import { encrypt, decrypt } from './crypto.js';
 import * as db from './db.js';
-import { readCurrentAccount } from './account.js';
+import { readCurrentAccount, locateAccount, hasIdentity } from './account.js';
 import { deriveEoa } from './identity.js';
 import {
   detectNetwork,
@@ -38,6 +38,7 @@ function printAccount(label, acc) {
   console.log(`  Safe address: ${fmtAddr(acc.safe)}`);
   console.log(`  Network     : ${acc.network || '(undetected)'}`);
   if (acc.blokliUrl) console.log(`  Blokli URL  : ${acc.blokliUrl}`);
+  console.log(`  Identity    : ${acc.location.files.id}`);
   if (acc.balances) {
     console.log(`  xDAI  (EOA) : ${acc.balances.xdai ?? '(unknown)'}`);
     console.log(`  wxHOPR(Safe): ${acc.balances.wxhopr ?? '(unknown)'}`);
@@ -169,9 +170,9 @@ async function saveAccount(pool, config, acc, { name, network } = {}) {
 }
 
 // Perform a swap to the saved account row `target`.
-async function doSwap(pool, config, target, { serviceName } = {}) {
+async function doSwap(pool, config, target, { serviceName, userName } = {}) {
   // Refuse if it's already the active account.
-  const current = await readCurrentAccount(config, { serviceName });
+  const current = await readCurrentAccount({ serviceName, userName });
   if (current && current.address && target.address && current.address === target.address) {
     console.log(`Account ${target.id} (${target.name}) is already active. Nothing to do.`);
     return;
@@ -188,15 +189,17 @@ async function doSwap(pool, config, target, { serviceName } = {}) {
   // No account on disk => we're inserting one, not swapping from an existing one.
   const inserting = !current;
 
+  const location = current?.location ?? (await locateAccount({ serviceName, userName }));
   const { backupDir, manager, guiLaunched } = await swapFiles({
-    files: config.files,
+    location,
     decrypted,
     svc,
     timestamp: nowStamp(),
   });
 
   console.log(`\n✔ ${inserting ? 'Inserted' : 'Swapped to'} account ${target.id} (${target.name}).`);
-  if (!inserting) console.log(`  Previous files backed up to: ${backupDir}`);
+  console.log(`  Written to  : ${location.files.id}`);
+  if (!inserting && backupDir) console.log(`  Previous files backed up to: ${backupDir}`);
   if (manager) console.log(`  Service (${manager}) restarted: ${svc.name}`);
   if (guiLaunched) console.log('  GUI client app relaunched.');
   if (!manager && !guiLaunched) {
@@ -211,7 +214,10 @@ async function doSwap(pool, config, target, { serviceName } = {}) {
   if (detected && target.network && detected !== target.network) {
     console.log(
       `\n⚠  Network mismatch: account is for "${target.network}" but the service is ` +
-        `configured for "${detected}". You may need to reconfigure the client.`,
+        `configured for "${detected}". ` +
+        (location.layout === 'per-user'
+          ? `It was written to the "${detected}" slot; switching networks won't take it along.`
+          : 'You may need to reconfigure the client.'),
     );
   }
 }
@@ -270,8 +276,8 @@ async function restartApp({ serviceName } = {}) {
 // Reset this machine to a freshly-installed client state, optionally switching
 // the network on the way back up. `switchNetwork` is either a network name or
 // `true` to prompt for one.
-async function clearMachine(config, pool, { serviceName, switchNetwork } = {}) {
-  const acc = await readCurrentAccount(config, { serviceName });
+async function clearMachine(config, pool, { serviceName, userName, switchNetwork } = {}) {
+  const acc = await readCurrentAccount({ serviceName, userName });
   if (!acc && !switchNetwork) {
     console.log('No account on disk to clear.');
     return;
@@ -316,18 +322,25 @@ async function clearMachine(config, pool, { serviceName, switchNetwork } = {}) {
     }
   }
 
+  const location = acc?.location ?? (await locateAccount({ serviceName, userName }));
   const svc = await detectService({ serviceName });
-  const result = await resetMachine({ config, svc, network: target });
+  const result = await resetMachine({ location, svc, network: target });
 
   console.log(
     `\n✔ Reset this machine to a freshly-installed client state${target ? ` on "${target}"` : ''}.`,
   );
   printMachineResult(result, svc);
-  console.log('  The client will generate a fresh identity on start-up.');
+  // Per-user, each network has its own slot — the target's may already hold one.
+  const next = target ? await locateAccount({ userName, network: target }) : location;
+  console.log(
+    (await hasIdentity(next))
+      ? `  The client will use the identity already in ${next.files.id}.`
+      : '  The client will generate a fresh identity on start-up.',
+  );
 }
 
 // Point the installed client at another network, keeping the account on disk.
-async function switchNetworkOnMachine({ serviceName, network } = {}) {
+async function switchNetworkOnMachine({ serviceName, userName, network } = {}) {
   const { network: current } = await detectNetwork({ serviceName });
   const target =
     network ||
@@ -341,17 +354,21 @@ async function switchNetworkOnMachine({ serviceName, network } = {}) {
     return;
   }
 
+  const next = await locateAccount({ userName, network: target });
   const ok = await confirm({
     message:
       `Switch the client from "${current || 'unknown'}" to "${target}"? ` +
-      'The account on disk is kept — its safe and node database belong to the old network, ' +
-      'so clearing the account as well is usually the right move.',
+      (next.layout === 'per-user'
+        ? `Each network has its own identity: the current one stays on disk, and "${target}" uses ` +
+          ((await hasIdentity(next)) ? `the one in ${next.files.id}.` : 'a freshly generated one.')
+        : 'The account on disk is kept — its safe and node database belong to the old network, ' +
+          'so clearing the account as well is usually the right move.'),
     default: false,
   });
   if (!ok) return;
 
   const svc = await detectService({ serviceName });
-  const result = await switchMachineNetwork({ svc, network: target });
+  const result = await switchMachineNetwork({ location: next, svc, network: target });
 
   console.log(`\n✔ Switched the client to "${target}".`);
   printMachineResult(result, svc);
@@ -388,7 +405,7 @@ async function pause() {
   await input({ message: 'Press Enter to return to the menu…' });
 }
 
-async function interactive(config, pool, { serviceName } = {}) {
+async function interactive(config, pool, { serviceName, userName } = {}) {
   // EOA addresses the user chose not to save this session — so we don't
   // re-prompt for the same account on every screen redraw.
   const skipped = new Set();
@@ -397,7 +414,7 @@ async function interactive(config, pool, { serviceName } = {}) {
   for (;;) {
     console.clear();
 
-    const acc = await readCurrentAccount(config, { serviceName, withBalances: true });
+    const acc = await readCurrentAccount({ serviceName, userName, withBalances: true });
     if (!acc) {
       console.log('No account currently in use (no identity file on disk).');
     } else {
@@ -507,16 +524,16 @@ async function interactive(config, pool, { serviceName } = {}) {
     } else if (res.action === 'privkey') {
       await showPrivateKey(config, pool, res.value);
     } else if (res.value === CLEAR_ACTION) {
-      await clearMachine(config, pool, { serviceName });
+      await clearMachine(config, pool, { serviceName, userName });
     } else if (res.value === CLEAR_SWITCH_ACTION) {
-      await clearMachine(config, pool, { serviceName, switchNetwork: true });
+      await clearMachine(config, pool, { serviceName, userName, switchNetwork: true });
     } else if (res.value === SWITCH_ACTION) {
-      await switchNetworkOnMachine({ serviceName });
+      await switchNetworkOnMachine({ serviceName, userName });
     } else {
       const target = await db.getAccountById(pool, res.value);
       const verb = acc ? 'Swap to' : 'Insert';
       const ok = await confirm({ message: `${verb} "${target.name}" (${target.address})?` });
-      if (ok) await doSwap(pool, config, target, { serviceName });
+      if (ok) await doSwap(pool, config, target, { serviceName, userName });
     }
 
     await pause(); // show the action's output, then redraw on the next loop
@@ -530,7 +547,8 @@ program
   .name('gvpn-accounts')
   .description('Manage and swap Gnosis VPN accounts (HOPR identities), backed by MySQL.')
   .option('--env <path>', 'path to the .env file', '.env')
-  .option('--service <name>', 'service unit/label to control');
+  .option('--service <name>', 'service unit/label to control')
+  .option('--user <name>', 'user whose account to manage (default: the sudo/desktop user)');
 
 program
   .command('current')
@@ -538,8 +556,11 @@ program
   .action(async () => {
     ensureRoot();
     const opts = program.opts();
-    const config = loadConfig({ envPath: opts.env });
-    const acc = await readCurrentAccount(config, { serviceName: opts.service, withBalances: true });
+    const acc = await readCurrentAccount({
+      serviceName: opts.service,
+      userName: opts.user,
+      withBalances: true,
+    });
     if (!acc) {
       console.log('No account currently in use (no identity file on disk).');
       return;
@@ -568,8 +589,9 @@ program
     ensureRoot();
     const opts = program.opts();
     await withPool(opts, async (config, pool) => {
-      const acc = await readCurrentAccount(config, {
+      const acc = await readCurrentAccount({
         serviceName: opts.service,
+        userName: opts.user,
         eoaOverride: cmdOpts.eoa,
         withBalances: true,
       });
@@ -606,7 +628,7 @@ program
         process.exitCode = 1;
         return;
       }
-      await doSwap(pool, config, target, { serviceName: opts.service });
+      await doSwap(pool, config, target, { serviceName: opts.service, userName: opts.user });
     });
   });
 
@@ -620,6 +642,7 @@ program
     await withPool(opts, (config, pool) =>
       clearMachine(config, pool, {
         serviceName: opts.service,
+        userName: opts.user,
         switchNetwork: cmdOpts.switchNetwork,
       }),
     );
@@ -632,14 +655,16 @@ program
   .action(async (network) => {
     ensureRoot();
     const opts = program.opts();
-    await switchNetworkOnMachine({ serviceName: opts.service, network });
+    await switchNetworkOnMachine({ serviceName: opts.service, userName: opts.user, network });
   });
 
 // Default action (no subcommand) = interactive flow.
 program.action(async () => {
   ensureRoot();
   const opts = program.opts();
-  await withPool(opts, (config, pool) => interactive(config, pool, { serviceName: opts.service }));
+  await withPool(opts, (config, pool) =>
+    interactive(config, pool, { serviceName: opts.service, userName: opts.user }),
+  );
 });
 
 program.parseAsync(process.argv).catch((err) => {

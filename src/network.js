@@ -17,7 +17,7 @@ import {
   SERVICE_CONFIG_LINK,
   DYNAMIC_ENV_FILE,
   LAUNCHD_PLIST,
-  MAC_NETWORK_CHOICE,
+  macNetworkChoiceFile,
 } from './paths.js';
 
 const execFileAsync = promisify(execFile);
@@ -31,7 +31,14 @@ function isRoot() {
 
 // Networks offered when detection fails. Not a closed set — networkFromUrl()
 // derives any <prefix>-<env> pair and the prompt also accepts free text.
-export const KNOWN_NETWORKS = ['jura-prod', 'jura-staging', 'jura-dev', 'piz-palu-dev'];
+export const KNOWN_NETWORKS = [
+  'jura-prod',
+  'jura-staging',
+  'jura-dev',
+  'piz-palu-prod',
+  'piz-palu-staging',
+  'piz-palu-dev',
+];
 
 // https://blokli-<prefix>.<env>.hoprnet.link -> "<prefix>-<env>"
 const BLOKLI_RE = /^https?:\/\/blokli-([a-z0-9-]+)\.([a-z0-9-]+)\.hoprnet\.link/i;
@@ -287,14 +294,16 @@ async function writePlistUrl(blokliUrl, changed) {
 
 // macOS: record the choice the way the installer's choice sub-package does, so
 // a later pkg run or in-app update doesn't silently flip back to the default.
-async function writeNetworkChoice(network, changed) {
-  await fs.mkdir(path.dirname(MAC_NETWORK_CHOICE), { recursive: true });
-  await fs.writeFile(MAC_NETWORK_CHOICE, `INSTALLER_CHOICE_NETWORK="${network}"\n`);
-  changed.push(MAC_NETWORK_CHOICE);
+async function writeNetworkChoice(network, layout, changed) {
+  const file = macNetworkChoiceFile(layout);
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, `INSTALLER_CHOICE_NETWORK="${network}"\n`);
+  changed.push(file);
 }
 
-// Point the installed client at `network`. Returns { network, blokliUrl, changed }.
-export async function applyNetwork(network, { platform = process.platform } = {}) {
+// Point the installed client at `network`. `layout` is detectLayout()'s.
+// Returns { network, blokliUrl, changed }.
+export async function applyNetwork(network, { platform = process.platform, layout } = {}) {
   const configFile = configFileFor(network, platform);
   try {
     await fs.access(configFile);
@@ -318,7 +327,7 @@ export async function applyNetwork(network, { platform = process.platform } = {}
 
   if (platform === 'darwin') {
     await writePlistUrl(blokliUrl, changed);
-    await writeNetworkChoice(network, changed);
+    await writeNetworkChoice(network, layout, changed);
   } else {
     await writeDynamicEnv(blokliUrl, changed);
     // /etc/gnosisvpn/gnosisvpn.env is deliberately left alone: it's a dpkg

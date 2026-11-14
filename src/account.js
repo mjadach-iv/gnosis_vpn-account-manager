@@ -1,11 +1,13 @@
-// Read the account currently installed on disk: the three files plus the
-// EOA/safe (via ctl, falling back to the .safe YAML) and the network.
+// Locate and read the account currently installed on disk: the three files plus
+// the EOA/safe (via ctl, falling back to the .safe YAML) and the network.
 
 import fs from 'node:fs/promises';
 import yaml from 'js-yaml';
 import { balance, chainBalances } from './ctl.js';
 import { deriveEoa } from './identity.js';
 import { detectNetwork } from './network.js';
+import { detectLayout, networkFiles, resolveFiles, resolveHome, userDirs } from './paths.js';
+import { resolveUser } from './user.js';
 
 // Read a file, treating only "not found" as null. Permission and other errors
 // are surfaced so a protected/unreadable file isn't mistaken for an absent one.
@@ -15,6 +17,38 @@ async function readFileOrNull(file) {
   } catch (err) {
     if (err.code === 'ENOENT') return null;
     throw new Error(`cannot read ${file}: ${err.code || err.message} (try sudo / grant Full Disk Access on macOS)`);
+  }
+}
+
+// Where the client keeps the account it uses for `network` (default: the one it is
+// configured for). Per-user layout:
+//   { layout:'per-user', user:{name,uid,gid,home}, network, dirs:{data,cache,logs}, files }
+// Legacy layout, one identity for every network and user:
+//   { layout:'legacy', home, files }
+export async function locateAccount({ userName, serviceName, network } = {}) {
+  const layout = detectLayout();
+  if (layout === 'legacy') return { layout, home: resolveHome(), files: resolveFiles() };
+
+  const user = await resolveUser(userName);
+  if (!user) throw new Error('No desktop user found to manage the account of — pass --user <name>.');
+  const net = network || (await detectNetwork({ serviceName })).network;
+  if (!net) {
+    throw new Error(
+      "Could not detect the client's network, which keys where the account is stored. " +
+        'Check that /etc/gnosisvpn/config.toml links to a network config.',
+    );
+  }
+  const dirs = userDirs(user.home);
+  return { layout, user, network: net, dirs, files: networkFiles(dirs, net) };
+}
+
+// Whether `location` already holds an identity.
+export async function hasIdentity(location) {
+  try {
+    await fs.access(location.files.id);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -35,10 +69,12 @@ export function parseSafe(safeBuf) {
 //
 // Returns null if no .id file is present ("no account currently in use").
 // Otherwise returns:
-//   { present, files:{id,pass,safe} (Buffers), address, safe, network, blokliUrl, eoaSource }
+//   { present, location, files:{id,pass,safe} (Buffers), address, safe, network, blokliUrl, eoaSource }
 // `eoaOverride` lets the caller supply an EOA when ctl is unreachable.
-export async function readCurrentAccount(config, { serviceName, eoaOverride, withBalances } = {}) {
-  const { files } = config;
+export async function readCurrentAccount({ serviceName, userName, eoaOverride, withBalances } = {}) {
+  const { network, blokliUrl } = await detectNetwork({ serviceName });
+  const location = await locateAccount({ userName, serviceName, network });
+  const { files } = location;
 
   const idBuf = await readFileOrNull(files.id);
   if (!idBuf) return null; // no account in use
@@ -69,7 +105,8 @@ export async function readCurrentAccount(config, { serviceName, eoaOverride, wit
   // lacked it), then to a caller-supplied override.
   if (!address || !safe) {
     const ctl = await balance();
-    if (ctl) {
+    // The running worker may hold another user's or network's account than this slot.
+    if (ctl && (!address || ctl.nodeAddress.toLowerCase() === address.toLowerCase())) {
       if (!address) {
         address = ctl.nodeAddress;
         eoaSource = 'ctl';
@@ -82,8 +119,6 @@ export async function readCurrentAccount(config, { serviceName, eoaOverride, wit
     eoaSource = 'override';
   }
 
-  const { network, blokliUrl } = await detectNetwork({ serviceName });
-
   // On-chain balances: native xDAI of the EOA, wxHOPR of the safe.
   let balances = null;
   if (withBalances && (address || safe)) {
@@ -92,6 +127,7 @@ export async function readCurrentAccount(config, { serviceName, eoaOverride, wit
 
   return {
     present: true,
+    location,
     files: { id: idBuf, pass: passBuf, safe: safeBuf },
     address,
     safe,
