@@ -3,6 +3,7 @@
 
 import { Command } from 'commander';
 import { input, select, confirm } from '@inquirer/prompts';
+import { getAddress, isAddress } from 'viem';
 import { loadConfig } from './config.js';
 import { encrypt, decrypt } from './crypto.js';
 import * as db from './db.js';
@@ -12,6 +13,7 @@ import {
   detectNetwork,
   networkFromUrl,
   installedNetworks,
+  urlForNetwork,
   KNOWN_NETWORKS,
 } from './network.js';
 import {
@@ -20,7 +22,10 @@ import {
   resetMachine,
   switchMachineNetwork,
   restartService,
+  stopClient,
+  startClient,
 } from './service.js';
+import { planCashOut, executeCashOut, fmtToken } from './cashout.js';
 import { SERVICE_CONFIG_DIR } from './paths.js';
 import { chainBalances } from './ctl.js';
 import { accountMenu } from './menu.js';
@@ -400,6 +405,119 @@ async function showPrivateKey(config, pool, id) {
   }
 }
 
+function printCashOutPlan(name, plan) {
+  console.log(`\nCash-out of "${name}" on ${plan.network} (${plan.blokliUrl})`);
+  console.log(
+    `  Node  ${plan.address}  xDAI ${fmtToken(plan.balances.xdai)} | wxHOPR ${fmtToken(plan.balances.wxhopr)}`,
+  );
+  if (plan.safe) {
+    console.log(
+      `  Safe  ${plan.safe.address}  xDAI ${fmtToken(plan.safe.xdai)} | wxHOPR ${fmtToken(plan.safe.wxhopr)}` +
+        (plan.safe.sweepable ? '' : '  (not sweepable: the node is not its only required signer)'),
+    );
+  } else {
+    console.log('  Safe  (none on this network)');
+  }
+  if (!plan.channels.length) {
+    console.log('  No open outgoing channels.');
+    return;
+  }
+  console.log(
+    `  ${plan.channels.length} outgoing channel(s) to close — then a ` +
+      `${Math.round(plan.gracePeriod / 60)} min grace period before their wxHOPR is back in the safe:`,
+  );
+  for (const ch of plan.channels) {
+    console.log(`    → ${ch.destination}  ${fmtToken(ch.balance)} wxHOPR  ${ch.status}`);
+  }
+}
+
+// Close a saved account's outgoing channels and send all of its wxHOPR and xDAI
+// to one address. `active` is the account currently on this machine, if any.
+async function cashOutAccount(config, pool, id, { serviceName, active } = {}) {
+  const target = await db.getAccountById(pool, id);
+  if (!target.pass_blob) {
+    console.log(`Account #${id} has no stored identity password — cannot sign for it.`);
+    return;
+  }
+
+  const isActive = !!active?.address && active.address.toLowerCase() === target.address.toLowerCase();
+  // An identity carried across a network rename keeps the old name in the DB.
+  const preferred = (isActive && active.network) || target.network;
+  // Pre-rename names (jura, rotsee) have no endpoint of their own.
+  const networks = [...new Set([preferred, ...KNOWN_NETWORKS])].filter((n) => n && urlForNetwork(n));
+  const network = await select({
+    message: 'Cash out on which network?',
+    choices: networks.map((n) => ({ name: n === target.network ? `${n}  (saved with)` : n, value: n })),
+    default: networks.includes(preferred) ? preferred : undefined,
+  });
+
+  const plan = await planCashOut({ address: target.address, network, blokliUrl: urlForNetwork(network) });
+  printCashOutPlan(target.name, plan);
+
+  const funds = plan.balances.xdai + plan.balances.wxhopr + (plan.safe?.xdai ?? 0n) + (plan.safe?.wxhopr ?? 0n);
+  if (!plan.channels.length && funds === 0n) {
+    console.log('\nNothing to cash out.');
+    return;
+  }
+  if (plan.channels.length && plan.balances.xdai < plan.gasNeeded) {
+    console.log(
+      `\n⚠  Closing the channels can cost up to ${fmtToken(plan.gasNeeded)} xDAI in gas, more than the ` +
+        `node holds — send ${plan.address} at least ${fmtToken(plan.gasNeeded - plan.balances.xdai)} xDAI first.`,
+    );
+    return;
+  }
+  console.log(
+    '\nIf this account runs on another machine, stop the client there first — it would reopen channels.',
+  );
+
+  const own = [plan.address, plan.safe?.address].filter(Boolean).map((a) => a.toLowerCase());
+  const recipient = getAddress(
+    (
+      await input({
+        message: 'Send all wxHOPR and xDAI to which address?',
+        validate: (v) => {
+          if (!isAddress(v.trim(), { strict: false })) return 'Not an address.';
+          if (own.includes(v.trim().toLowerCase())) return "That is the account's own address.";
+          return true;
+        },
+      })
+    ).trim(),
+  );
+  const answer = await input({
+    message:
+      `Type "Yes" to ${plan.channels.length ? `close ${plan.channels.length} channel(s) and ` : ''}` +
+      `send everything to ${recipient}:`,
+  });
+  if (answer.trim().toLowerCase() !== 'yes') {
+    console.log('Cancelled — nothing was sent.');
+    return;
+  }
+
+  const { privateKey } = deriveEoa(
+    decrypt(target.id_blob, config.encryptionKey),
+    decrypt(target.pass_blob, config.encryptionKey),
+  );
+
+  // The running node would reopen channels and race us for the EOA's nonce.
+  let svc = null;
+  if (isActive) {
+    svc = await detectService({ serviceName });
+    console.log('\nStopping the client, as it runs this account…');
+    await stopClient(svc);
+  }
+  try {
+    const { closed, sent } = await executeCashOut({ plan, privateKey, recipient });
+    console.log(
+      `\n✔ Cashed out "${target.name}": ${closed} channel(s) closed, ` +
+        `${fmtToken(sent.wxhopr)} wxHOPR and ${fmtToken(sent.xdai)} xDAI sent to ${recipient}.`,
+    );
+  } finally {
+    if (svc) {
+      await startClient(svc).catch((err) => console.log(`⚠  Could not restart the client: ${err.message}`));
+    }
+  }
+}
+
 // Wait for Enter, then redraw the screen for the next menu iteration.
 async function pause() {
   await input({ message: 'Press Enter to return to the menu…' });
@@ -523,6 +641,14 @@ async function interactive(config, pool, { serviceName, userName } = {}) {
       }
     } else if (res.action === 'privkey') {
       await showPrivateKey(config, pool, res.value);
+    } else if (res.action === 'cashout') {
+      try {
+        await cashOutAccount(config, pool, res.value, { serviceName, active: acc });
+      } catch (err) {
+        if (err.name === 'ExitPromptError') throw err;
+        console.log(`\n✖ Cash-out stopped: ${err.shortMessage || err.message}`);
+        console.log('  Run it again to continue — channels already closing are picked up as they are.');
+      }
     } else if (res.value === CLEAR_ACTION) {
       await clearMachine(config, pool, { serviceName, userName });
     } else if (res.value === CLEAR_SWITCH_ACTION) {

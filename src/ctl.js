@@ -36,7 +36,7 @@ export async function balance() {
 // read them straight from a Gnosis RPC endpoint. Override the endpoint with
 // GNOSIS_RPC_URL.
 
-const GNOSIS_RPC = process.env.GNOSIS_RPC_URL || 'https://rpc.gnosischain.com';
+export const GNOSIS_RPC = process.env.GNOSIS_RPC_URL || 'https://rpc.gnosischain.com';
 export const WXHOPR_TOKEN = '0xD4fdec44DB9D44B8f2b6d529620f9C0C7066A2c1';
 const ERC20_DECIMALS = 18; // wxHOPR (and xDAI) both use 18 decimals
 

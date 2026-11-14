@@ -3,10 +3,11 @@
 // Like a basic `select`, but Del/Backspace on a deletable choice resolves with
 // an { action: 'delete' } result so the caller can confirm + remove it, and `r`
 // on a deletable choice resolves with { action: 'rename' }, `p` with
-// { action: 'privkey' }. Enter resolves with { action: 'select' }.
+// { action: 'privkey' }, `c` with { action: 'cashout' }. Enter resolves with
+// { action: 'select' }.
 //
 // choices: [{ name, value, deletable }]
-// resolves: { action: 'select' | 'delete' | 'rename' | 'privkey', value, name, deletable }
+// resolves: { action: 'select' | 'delete' | 'rename' | 'privkey' | 'cashout', value, name, deletable }
 
 import {
   createPrompt,
@@ -56,6 +57,13 @@ export const accountMenu = createPrompt((config, done) => {
         setStatus('done');
         done({ action: 'privkey', ...choice });
       }
+    } else if (key.name === 'c' && !key.ctrl) {
+      // Ctrl+C also arrives as `c`; it must exit, never start moving funds.
+      const choice = choices[active];
+      if (choice.deletable) {
+        setStatus('done');
+        done({ action: 'cashout', ...choice });
+      }
     }
   });
 
@@ -73,7 +81,7 @@ export const accountMenu = createPrompt((config, done) => {
   }
 
   const help =
-    '\x1b[2m(↑/↓ move · Enter select · r rename · p private key · Del/Backspace remove a saved account)\x1b[0m';
+    '\x1b[2m(↑/↓ move · Enter select · r rename · p private key · c cash out · Del/Backspace remove a saved account)\x1b[0m';
 
   return `${prefix} ${message}\n${list}\n\n${help}`;
 });

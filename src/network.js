@@ -1,9 +1,9 @@
 // Detect which network the client is configured for, from the config.toml
 // symlink and/or GNOSISVPN_HOPR_BLOKLI_URL in the service definition/environment.
 //
-// Network names follow the client's <prefix>-<env> scheme (jura-prod, jura-dev,
+// Network names follow the client's <prefix>-<env> scheme (piz-palu-prod,
 // piz-palu-dev, …) and the Blokli endpoint mirrors that split:
-//   https://blokli-<prefix>.<env>.hoprnet.link
+//   https://blokli.<prefix>.gnosisvpn.io (prod), https://blokli.<prefix>.<env>.gnosisvpn.io
 //
 // Returns { network: string|null, blokliUrl: string|null }.
 
@@ -40,14 +40,18 @@ export const KNOWN_NETWORKS = [
   'piz-palu-dev',
 ];
 
-// https://blokli-<prefix>.<env>.hoprnet.link -> "<prefix>-<env>"
-const BLOKLI_RE = /^https?:\/\/blokli-([a-z0-9-]+)\.([a-z0-9-]+)\.hoprnet\.link/i;
+// https://blokli.<prefix>[.<env>].gnosisvpn.io -> "<prefix>-<env>", no env being prod
+const BLOKLI_RE = /^https?:\/\/blokli\.([a-z0-9-]+)(?:\.([a-z0-9-]+))?\.gnosisvpn\.io/i;
+// Before installer #526: https://blokli-<prefix>.<env>.hoprnet.link
+const HOPRNET_BLOKLI_RE = /^https?:\/\/blokli-([a-z0-9-]+)\.([a-z0-9-]+)\.hoprnet\.link/i;
 
 // Map a blokli URL to a network name.
 export function networkFromUrl(url) {
   if (!url) return null;
   const m = url.match(BLOKLI_RE);
-  if (m) return `${m[1]}-${m[2]}`.toLowerCase();
+  if (m) return `${m[1]}-${m[2] || 'prod'}`.toLowerCase();
+  const old = url.match(HOPRNET_BLOKLI_RE);
+  if (old) return `${old[1]}-${old[2]}`.toLowerCase();
   // Legacy endpoints that predate the <prefix>-<env> scheme.
   const u = url.toLowerCase();
   if (u.includes('rotsee')) return 'rotsee';
@@ -60,7 +64,11 @@ export function networkFromUrl(url) {
 export function urlForNetwork(network) {
   const i = network ? network.lastIndexOf('-') : -1;
   if (i <= 0 || i === network.length - 1) return null;
-  return `https://blokli-${network.slice(0, i)}.${network.slice(i + 1)}.hoprnet.link`;
+  const prefix = network.slice(0, i);
+  const env = network.slice(i + 1);
+  return env === 'prod'
+    ? `https://blokli.${prefix}.gnosisvpn.io`
+    : `https://blokli.${prefix}.${env}.gnosisvpn.io`;
 }
 
 // Map a config file name to a network: config-jura-dev.toml / jura-dev.toml

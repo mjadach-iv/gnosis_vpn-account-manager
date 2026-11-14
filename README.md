@@ -141,9 +141,11 @@ Global options:
 ### Networks
 
 Accounts are stored with the network they belong to. Network names follow the client's
-`<prefix>-<env>` scheme — `jura-prod`, `jura-staging`, `jura-dev`, `piz-palu-dev` — and the Blokli
-endpoint mirrors that split (`https://blokli-<prefix>.<env>.hoprnet.link`), so any future network is
-recognised without a code change.
+`<prefix>-<env>` scheme — `piz-palu-prod`, `piz-palu-staging`, `piz-palu-dev` (and the retired
+`jura-*`) — and the Blokli endpoint mirrors that split, as the installer derives it:
+`https://blokli.<prefix>.gnosisvpn.io` for `prod`, `https://blokli.<prefix>.<env>.gnosisvpn.io`
+otherwise. The older `https://blokli-<prefix>.<env>.hoprnet.link` endpoints are still recognised.
+Any future network is recognised without a code change.
 
 The network is detected read-only, in this order:
 
@@ -216,6 +218,29 @@ confirmation says which. **Clear and switch** additionally removes the current n
 Under the legacy layout the single identity carries over, but its safe and node database belong to
 the old network — so **clear and switch** is usually what you want there.
 
+### Cashing out
+
+`c` on a saved account empties it on one network, signing with the account's own key:
+
+1. Every outgoing channel still open is closed through the node's safe module
+   (`initiateOutgoingChannelClosureSafe`); channels already closing are picked up as they are.
+2. The tool waits out the network's closure grace period (5 minutes on piz-palu, read from Blokli),
+   then finalizes each channel, which returns its wxHOPR to the safe.
+3. All wxHOPR and xDAI in the safe go to the address you give, through a Safe transaction the node
+   signs as the safe's 1-of-1 owner. Then the node's own wxHOPR, and last its xDAI, minus the fee of
+   that final transfer.
+
+Nothing is sent before you see the channels and balances it found and type `Yes`. Channel states are
+read from the contract, not Blokli, so a rerun right after an interrupted one is accurate. The node
+pays the gas: if it holds less xDAI than the worst case for closing every channel, the tool says how
+much to send it and stops before touching anything. If the account is the one on this machine, the client is stopped for
+the duration, so it can't reopen channels. Stop it yourself on any other machine running the
+account. A run that stops part-way (e.g. Ctrl+C during the wait) is safe to repeat.
+
+The network defaults to the one the account was saved with, or the one the client uses if the
+account is active. An identity carried from `jura-*` to `piz-palu-*` has a separate safe and channels
+on each, so cash out on both if it was used on both.
+
 ### Interactive menu
 
 Running with no subcommand opens an interactive menu (see the screenshot above).
@@ -241,6 +266,7 @@ Menu controls:
 - **r** — rename the highlighted saved account.
 - **p** — decrypt the highlighted saved account's identity and print its
   address, safe address and private key (confirm with `y`).
+- **c** — cash out the highlighted saved account — see [Cashing out](#cashing-out).
 - **Del / Backspace** — delete the highlighted saved account from the database
   (you must type `Yes` to confirm).
 - **🗑 Clear current account from this machine** — reset the machine to a
