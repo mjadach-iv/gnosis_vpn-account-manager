@@ -77,6 +77,27 @@ scripts/build.sh node22-linux-x64           # one or more explicit targets
 Output binaries land in `dist/bin/`, e.g. `gvpn-accounts-linux-x64`,
 `gvpn-accounts-macos-arm64`.
 
+Each build is stamped with a build tag, `<package version>-YYYYMMDDHHMM` (the
+build time), which `gvpn-accounts --version` prints (`dev` when run from source).
+
+The build leaves the binaries executable, but copying them to another machine
+(a browser download, `curl`, chat or a shared drive) usually drops the
+executable bit. Set it again on the target machine:
+
+```sh
+chmod +x gvpn-accounts-linux-x64
+```
+
+On macOS, a downloaded file is also quarantined and Gatekeeper refuses to run
+it. Clear the flag after `chmod`:
+
+```sh
+chmod +x gvpn-accounts-macos-arm64
+xattr -d com.apple.quarantine gvpn-accounts-macos-arm64   # "No such xattr" is fine
+```
+
+Then run it (with `sudo` for commands that change the machine's account):
+
 ```sh
 sudo ./gvpn-accounts-linux-x64 swap 3
 ```

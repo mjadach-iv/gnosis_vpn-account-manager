@@ -21,6 +21,8 @@ cd "$(dirname "$0")/.."
 NODE_BASE="node22"
 OUT_DIR="dist/bin"
 ENV_FILE="${GVPN_ENV_FILE:-.env}"
+# Build tag: package version + build time (YYYYMMDDHHMM), shown by --version.
+BUILD_TAG="$(node -p "require('./package.json').version")-$(date +%Y%m%d%H%M)"
 
 # Map a pkg target triple to a friendly binary filename.
 bin_name() {
@@ -64,13 +66,14 @@ mkdir -p "$OUT_DIR"
 echo "==> Embedding config from $ENV_FILE"
 EMBEDDED="$(node scripts/embed-config.mjs "$ENV_FILE")"
 
-echo "==> Bundling with esbuild (config baked in)"
+echo "==> Bundling with esbuild (config baked in, build tag $BUILD_TAG)"
 npx esbuild src/index.js \
   --bundle \
   --platform=node \
   --target="$NODE_BASE" \
   --format=cjs \
   --define:__EMBEDDED_CONFIG__="\"$EMBEDDED\"" \
+  --define:__BUILD_TAG__="\"$BUILD_TAG\"" \
   --outfile=dist/index.cjs
 
 echo "==> Packaging binaries with pkg"
@@ -80,5 +83,5 @@ for target in "${TARGETS[@]}"; do
   npx pkg dist/index.cjs --targets "$target" --output "$out"
 done
 
-echo "==> Done. Binaries in $OUT_DIR:"
+echo "==> Done ($BUILD_TAG). Binaries in $OUT_DIR:"
 ls -lh "$OUT_DIR"

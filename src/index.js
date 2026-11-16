@@ -668,9 +668,15 @@ async function interactive(config, pool, { serviceName, userName } = {}) {
 
 // --- CLI -------------------------------------------------------------------
 
+// Build tag baked in by scripts/build.sh (`<version>-YYYYMMDDHHMM`); 'dev' when
+// running from source, where the token is undeclared.
+// eslint-disable-next-line no-undef
+const BUILD_TAG = typeof __BUILD_TAG__ !== 'undefined' ? __BUILD_TAG__ : 'dev';
+
 const program = new Command();
 program
   .name('gvpn-accounts')
+  .version(BUILD_TAG)
   .description('Manage and swap Gnosis VPN accounts (HOPR identities), backed by MySQL.')
   .option('--env <path>', 'path to the .env file', '.env')
   .option('--service <name>', 'service unit/label to control')
