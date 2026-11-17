@@ -18,6 +18,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const DEFAULT_SYSTEMD_UNIT = 'gnosisvpn';
 const DEFAULT_LAUNCHD_LABEL = 'com.gnosisvpn.gnosisvpnclient';
+const HELPER_UNIT = /logrotate/;
 
 // The GUI client app. macOS uses a bundle id; Linux uses the executable name
 // (`gnosis_vpn-app`, per the `Gnosis VPN.desktop` entry) and the desktop-file id
@@ -50,12 +51,17 @@ export async function detectService({ serviceName, platform = process.platform }
     const res = await tryExec('systemctl', ['list-units', '--all', '--type=service', '*gnosis*']);
     if (res.ok) {
       // Skip phantom "not-found" rows (a referenced-but-uninstalled unit still
-      // appears under `--all`) and pick the first real unit.
-      const line = res.stdout
+      // appears under `--all`).
+      const units = res.stdout
         .split('\n')
-        .find((l) => /\.service/.test(l) && !/not-found/.test(l));
-      const m = line && line.match(/([\w@.-]+\.service)/);
-      if (m) return { manager: 'systemd', name: m[1] };
+        .filter((l) => !/not-found/.test(l))
+        .map((l) => l.match(/([\w@.-]+\.service)/)?.[1])
+        .filter(Boolean);
+      // gnosisvpn-logrotate.service (installer 0.97.0+) sorts before the daemon.
+      const name =
+        units.find((u) => u === `${DEFAULT_SYSTEMD_UNIT}.service`) ??
+        units.find((u) => !HELPER_UNIT.test(u));
+      if (name) return { manager: 'systemd', name };
     }
     // systemctl present but nothing matched / not found.
     return { manager: null, name: serviceName || DEFAULT_SYSTEMD_UNIT };
